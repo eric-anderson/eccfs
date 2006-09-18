@@ -1,0 +1,16 @@
+Don't need to get the inode and device set in getattr calls, so don't
+need to worry about uniqueness; do need to track the other attributes.
+
+Need to track three values for rs_decode: original_size, n, m; can
+track original size as filesize * n - (small value), and encode
+small_value.  To do proper erasure coding, also need to store a hash
+of the encoded files because we need to verify a file before putting
+it back together.  This is enough that it is probably worth storing it
+all in the encoded files.  We cache verification of each file, and put
+a version number in so if we improve the encoding, e.g. by chunked
+hashes then we can be properly compatible.
+
+Therefore the getattr operation can just stat the file in the import
+dir, and if not there, try the same filepath in the various datadirs.
+
+
