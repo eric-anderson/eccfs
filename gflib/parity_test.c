@@ -39,6 +39,7 @@ $Revision: 1.2 $
 
 
 #include <stdio.h>
+#include <stdlib.h>
 #include "gflib.h"
 #include <sys/time.h>
 
@@ -61,7 +62,7 @@ main(int argc, char **argv)
   iterations = atoi(argv[2]);
   check_end = (argv[3][0] == 'Y' || argv[3][0] == 'y');
 
-  srand48();
+  srand48(time(NULL));
 
   y = (char *) malloc(size);
   x = (char *) malloc(size);
@@ -91,6 +92,6 @@ main(int argc, char **argv)
       if (z[i] != y[i]) printf("Error in byte %d\n", i);
     }
   }
-
+  exit(0);
 }
   

@@ -38,13 +38,21 @@ $Revision: 1.2 $
 */
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include "gflib.h"
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
 
+#include <arpa/inet.h>
+#include <openssl/sha.h>
+
+#include "header.h"
+
 /* This one is going to be in-core */
 
+int
 main(int argc, char **argv)
 {
   int i, j, *vdm, *inv, *prod, cache_size;
@@ -54,6 +62,8 @@ main(int argc, char **argv)
   char **buffer, *buf_file, *block;
   struct stat buf;
   FILE *f;
+  SHA_CTX ctx;
+  struct header file_header;
 
   if (argc != 5) {
     fprintf(stderr, "usage: rs_encode_file filename n m stem\n");
@@ -80,6 +90,13 @@ main(int argc, char **argv)
   }
   blocksize = sz/n;
 
+  file_header.version = 1;
+  if ((sz - orig_size) < 0 || (sz - orig_size) > 255 || n > 255 || m > 255) {
+      fprintf(stderr, "Huh\n");
+      abort();
+  }
+  file_header.under_size = sz - orig_size;
+
   buffer = (char **) malloc(sizeof(char *)*n);
   for (i = 0; i < n; i++) {
     buffer[i] = (char *) malloc(blocksize);
@@ -93,30 +110,44 @@ main(int argc, char **argv)
   if (f == NULL) { perror(filename); }
   cache_size = orig_size;
 
+  SHA1_Init(&ctx);
   for (i = 0; i < n; i++) {
-    if (cache_size < blocksize) memset(buffer[i], 0, blocksize);
-    if (cache_size > 0) {
-      if (fread(buffer[i], 1, (cache_size > blocksize) ? blocksize : cache_size, f) <= 0) {
-        fprintf(stderr, "Couldn't read the right bytes into the buffer\n");
-        exit(1);
+      if (cache_size < blocksize) memset(buffer[i], 0, blocksize);
+      if (cache_size > 0) {
+	  int amt = (cache_size > blocksize) ? blocksize : cache_size;
+	  if (fread(buffer[i], 1, amt, f) <= 0) {
+	      fprintf(stderr, "Couldn't read the right bytes into the buffer\n");
+	      exit(1);
+	  }
+	  SHA1_Update(&ctx, buffer[i], amt);
       }
-    }
-    cache_size -= blocksize;
+      cache_size -= blocksize;
   }
   fclose(f);
-
+  SHA1_Final(file_header.sha1_file_hash, &ctx);
+  
   buf_file = (char *) malloc(sizeof(char)*(strlen(stem)+30));
   if (buf_file == NULL) { perror("malloc - buf_file"); exit(1); }
   block = (char *) malloc(sizeof(char)*blocksize);
   if (block == NULL) { perror("malloc - block"); exit(1); }
   for (i = 0; i < n; i++) {
-    sprintf(buf_file, "%s-%04d.rs", stem, i);
-    printf("Writing %s ...", buf_file); fflush(stdout);
-    f = fopen(buf_file, "w");
-    if (f == NULL) { perror(buf_file); exit(1); }
-    fwrite(buffer[i], 1, blocksize, f);
-    fclose(f);
-    printf(" Done\n");
+      int ret;
+      sprintf(buf_file, "%s-%04d.rs", stem, i);
+      setnmfilenum(&file_header, n,m,i);
+      printf("Writing %s ...", buf_file); fflush(stdout);
+      f = fopen(buf_file, "w");
+      if (f == NULL) { perror(buf_file); exit(1); }
+      SHA1_Init(&ctx);
+      SHA1_Update(&ctx, &file_header, 4+20);
+      SHA1_Update(&ctx, buffer[i], blocksize);
+      SHA1_Final(file_header.sha1_chunk_hash, &ctx);
+      ret = fwrite(&file_header, 1, sizeof(file_header), f);
+      if (ret != sizeof(file_header)) { perror(buf_file); exit(1); }
+      ret = fwrite(buffer[i], 1, blocksize, f);
+      if (ret != blocksize) { perror(buf_file); exit(1); }
+      ret = fclose(f);
+      if (ret != 0) { perror(buf_file); exit(1); }
+      printf(" Done\n");
   }
 
   factors = (int *) malloc(sizeof(int)*n);
@@ -127,39 +158,39 @@ main(int argc, char **argv)
   vdm = gf_make_dispersal_matrix(rows, cols);
 
   for (i = cols; i < rows; i++) {
-    sprintf(buf_file, "%s-%04d.rs", stem, i);
-    printf("Calculating  %s ...", buf_file); fflush(stdout);
-    memset(block, 0, blocksize); 
-    for (j = 0; j < cols; j++) {
-      tmp = vdm[i*cols+j]; 
-      if (tmp != 0) {
-        factor = gf_single_divide(tmp, factors[j]);
-/*        printf("M[%02d,%02d] = %3d.  Factors[%02d] = %3d.  Factor = %3d.\n",
-                i, j, tmp, j, factors[j], factor); */
-        factors[j] = tmp;
-/*        printf("     Block %2d Bef: %3d.  ", j, buffer[j][0]); */
-        gf_mult_region(buffer[j], blocksize, factor);
-/*        printf("Block %2d Aft: %3d.  ", j, buffer[j][0]); */
-/*         printf("Block %2d Bef: %3d.  ", i, block[0]); */
-        gf_add_parity(buffer[j], block, blocksize);
-       /*  printf("Block %2d Aft: %3d.\n", i, block[0]); */
+      int ret;
+      sprintf(buf_file, "%s-%04d.rs", stem, i);
+      printf("Calculating  %s ...", buf_file); fflush(stdout);
+      setnmfilenum(&file_header, n,m,i);
+      memset(block, 0, blocksize); 
+      for (j = 0; j < cols; j++) {
+	  tmp = vdm[i*cols+j]; 
+	  if (tmp != 0) {
+	      factor = gf_single_divide(tmp, factors[j]);
+	      factors[j] = tmp;
+	      gf_mult_region(buffer[j], blocksize, factor);
+	      gf_add_parity(buffer[j], block, blocksize);
+	  }
       }
-    }
-    printf(" writing  ...", buf_file); fflush(stdout);
-    f = fopen(buf_file, "w");
-    if (f == NULL) { perror(buf_file); exit(1); }
-    fwrite(block, 1, blocksize, f);
-    printf(" Done\n");
-    fclose(f);
+      printf(" writing  ..."); fflush(stdout);
+      f = fopen(buf_file, "w");
+      if (f == NULL) { perror(buf_file); exit(1); }
+      SHA1_Init(&ctx);
+      if (sizeof(struct header) != 4+20+20) {
+	  fprintf(stderr, "Header size mismatch\n");
+	  abort();
+      }
+      SHA1_Update(&ctx, &file_header, 4+20);
+      SHA1_Update(&ctx, block, blocksize);
+      SHA1_Final(file_header.sha1_chunk_hash, &ctx);
+      ret = fwrite(&file_header, 1, sizeof(file_header), f);
+      if (ret != sizeof(file_header)) { perror(buf_file); exit(1); }
+      ret = fwrite(block, 1, blocksize, f);
+      if (ret != blocksize) { perror(buf_file); exit(1); }
+      printf(" Done\n");
+      ret = fclose(f);
+      if (ret != 0) { perror(buf_file); exit(1); }
   }
 
-  sprintf(buf_file, "%s-info.txt", stem, i);
-  f = fopen(buf_file, "w");
-  if (f == NULL) { perror(buf_file); exit(1); }
-  fprintf(f, "%d\n", orig_size);
-  fprintf(f, "%d\n", sz);
-  fprintf(f, "%d\n", blocksize);
-  fprintf(f, "%d\n", n);
-  fprintf(f, "%d\n", m);
-  gf_write_matrix(f, vdm, rows, cols);
+  exit(0);
 }

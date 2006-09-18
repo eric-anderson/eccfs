@@ -39,10 +39,15 @@ $Revision: 1.2 $
 
 
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include "gflib.h"
 #include <sys/time.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <openssl/sha.h>
+
+#include "header.h"
 
 /* This one is going to be in-core */
 
@@ -57,6 +62,10 @@ main(int argc, char **argv)
   Condensed_Matrix *cm;
   int *mat, *id;
   FILE *f;
+  struct header header;
+  int ret;
+  SHA_CTX ctx;
+  unsigned char digest[20];
 
   if (argc != 2) {
     fprintf(stderr, "usage: rs_decode_file stem\n");
@@ -64,29 +73,46 @@ main(int argc, char **argv)
   }
   
   stem = argv[1];
+
   buf_file = (char *) malloc(sizeof(char)*(strlen(stem)+30));
   if (buf_file == NULL) { perror("malloc - buf_file"); exit(1); }
-  sprintf(buf_file, "%s-info.txt", stem, i);
-  f = fopen(buf_file, "r");
-  if (f == NULL) { perror(buf_file); exit(1); }
-  if (fscanf(f, "%d\n", &orig_size) != 1) { fprintf(stderr, "Error reading info file 1\n"); exit(1); }
-  if (fscanf(f, "%d\n", &sz) != 1) { fprintf(stderr, "Error reading info file 2\n"); exit(1); }
-  if (fscanf(f, "%d\n", &blocksize) != 1) { fprintf(stderr, "Error reading info file 3\n"); exit(1); }
-  if (fscanf(f, "%d\n", &n) != 1) { fprintf(stderr, "Error reading info file 4\n"); exit(1); }
-  if (fscanf(f, "%d\n", &m) != 1) { fprintf(stderr, "Error reading info file 5\n"); exit(1); }
-  vdm = gf_read_matrix(f, &rows, &cols);
-  if (vdm == NULL) { fprintf(stderr, "Error reading info file matrix\n"); exit(1); }
-  fclose(f);
-  
-  if (rows != n+m) {
-    fprintf(stderr, "Error in %s - rows != n+m\n", buf_file);
-    exit(1);
-  }
-  if (cols != n) {
-    fprintf(stderr, "Error in %s - cols != n\n", buf_file);
-    exit(1);
+
+  for(i=0; i < 255; ++i) {
+      sprintf(buf_file, "%s-%04d.rs", stem, i);
+      f = fopen(buf_file, "r");
+      if (NULL == f) {
+	  continue;
+      }
+      ret = fread(&header, sizeof(struct header), 1, f);
+      if (ret != 1) { perror(buf_file); exit(1); }
+      ret = fclose(f);
+      if (ret != 0) { perror(buf_file); exit(1); }
+      // could verify the file now, the paranoid would do that; we'll verify later.
+      break;
   }
 
+  if (stat(buf_file, &buf) != 0) {
+      perror(buf_file);
+      exit(1);
+  }
+
+  n = getn(&header);
+  m = getm(&header);
+  orig_size = (buf.st_size-sizeof(struct header)) * n - header.under_size;
+  rows = n + m;
+  cols = n;
+  vdm = gf_make_dispersal_matrix(rows, cols);
+
+  fprintf(stderr, "Hello orig=%d n=%d m=%d\n", orig_size, n, m);
+  sz = orig_size;
+  if (sz % (n*sizeof(unsigned char)) != 0) {
+    sz += (n*sizeof(unsigned char) - (sz % (n*sizeof(unsigned char))));
+  }
+  blocksize = sz/n;
+  if (blocksize != buf.st_size - sizeof(struct header)) {
+      fprintf(stderr, "huh confused blocksize?\n");
+      exit(1);
+  }
   exists = (int *) malloc(sizeof(int) * rows);
   if (exists == NULL) { perror("malloc - exists"); exit(1); }
   factors = (int *) malloc(sizeof(int) * rows);
@@ -104,23 +130,55 @@ main(int argc, char **argv)
   }
 
   j = 0;
+
+  // The excessively paranoid would keep the first header and compare
+  // it exactly to the remaining entries, of course that implies we
+  // don't trust SHA1.
+
   for (i = 0; i < rows && j < cols; i++) {
     sprintf(buf_file, "%s-%04d.rs", stem, i);
     if (stat(buf_file, &buf) != 0) {
+      fprintf(stderr, "can't find %s\n", buf_file);
       map[i] = -1;
     } else {
-      if (buf.st_size != blocksize) {
+      if ((buf.st_size-sizeof(struct header)) != blocksize) {
+	fprintf(stderr, "Ignoring file %s, wrong size\n", buf_file);
         map[i] = -1;
       } else {
         map[i] = j++;
         f = fopen(buf_file, "r");
         if (f == NULL) { perror(buf_file); exit(1); }
+	ret = fread(&header, sizeof(struct header), 1, f);
+	if (ret != 1) { perror(buf_file); exit(1); }
+	if (getn(&header) != n || getm(&header) != m || 
+	    blocksize * n - header.under_size != orig_size ||
+	    getfilenum(&header) != i || 
+	    header.version != 1) {
+	    fprintf(stderr,"huh header simple check failed %d != %d || %d != %d || %d * %d - %d != %d || %d != %d || %d != 1?",
+		    getn(&header), n, getm(&header), m, 
+		    blocksize, n, header.under_size, orig_size,
+		    getfilenum(&header), i, 
+		    header.version);
+	    exit(1);
+	}
         k = fread(buffer[map[i]], 1, blocksize, f);
         if (k != blocksize) {
           fprintf(stderr, "%s -- stat says %d bytes, but only read %d\n", 
              buf_file, buf.st_size, k);
           exit(1);
         }
+	SHA1_Init(&ctx);
+	if (sizeof(header) != 4+20+20) {
+	    fprintf(stderr, "Header size mismatch\n");
+	    abort();
+	}
+	SHA1_Update(&ctx, &header, 4+20);
+	SHA1_Update(&ctx, buffer[map[i]], blocksize);
+	SHA1_Final(digest, &ctx);
+	if (memcmp(digest, header.sha1_chunk_hash, 20) != 0) {
+	    fprintf(stderr, "huh?\n");
+	    exit(1);
+	}
       }
     }
   }
@@ -175,22 +233,20 @@ main(int argc, char **argv)
 
   for(i = 0; i < rows; i++) factors[i] = 1;
 
+  SHA1_Init(&ctx);
   cache_size = orig_size;
   for (i = 0; i < cols && cache_size > 0; i++) {
+    int size;
     if (id[i] < cols) {
       fprintf(stderr, "Writing block %d from memory ... ", i); fflush(stderr);
       if (factors[i] != 1) {
         tmp = gf_single_divide(1, factors[i]);
-/*        fprintf(stderr, "Factor = %3d.  Tmp = %3d.  Before[0] = %3d.  ",
-                factors[i], tmp, (unsigned char) buffer[map[i]][0]); */
         factors[i] = 1;
         gf_mult_region(buffer[map[i]], blocksize, tmp);
-/*        fprintf(stderr, "After[0] = %3d.\n", (unsigned char) buffer[map[i]][0]); */
-      } else {
-/*        fprintf(stderr, "Factor = %3d.  Buffer[0] = %3d.\b", factors[i], 
-             (unsigned char) buffer[map[i]][0]); */
       }
-      fwrite(buffer[map[i]], 1, (cache_size > blocksize) ? blocksize : cache_size, stdout);
+      size = (cache_size > blocksize) ? blocksize : cache_size;
+      fwrite(buffer[map[i]], 1, size, stdout);
+      SHA1_Update(&ctx, buffer[map[i]], size);
       cache_size -= blocksize;
       fprintf(stderr, "Done\n"); fflush(stderr);
     } else {
@@ -199,19 +255,22 @@ main(int argc, char **argv)
       for (j = 0; j < cols; j++) {
         tmp = inv[i*cols+j];
         factor = gf_single_divide(tmp, factors[j]);
-/*        fprintf(stderr, "Factors[%d] = %3d.  Tmp = %3d.  Factor = %3d\n    Before[j][0] = %3d.  ", 
-                j, factors[j], tmp, factor, (unsigned char) buffer[map[j]][0]); */
         factors[j] = tmp;
         gf_mult_region(buffer[map[j]], blocksize, factor);
-/*        fprintf(stderr, "After[j][0] = %3d.  ", (unsigned char) buffer[map[j]][0]);
-        fprintf(stderr, "Before-block[0] = %3d.  ", (unsigned char) block[0]); */
         gf_add_parity(buffer[map[j]], block, blocksize);
-/*        fprintf(stderr, "After-block[0] = %3d.\n", (unsigned char) block[0]); */
       }
       fprintf(stderr, "writing ... "); fflush(stderr);
-      fwrite(block, 1, (cache_size > blocksize) ? blocksize : cache_size, stdout);
+      size = (cache_size > blocksize) ? blocksize : cache_size;
+      fwrite(block, 1, size, stdout);
+      SHA1_Update(&ctx, block, size);
       cache_size -= blocksize;
       fprintf(stderr, "Done\n"); fflush(stderr);
     }
   }
+  SHA1_Final(digest, &ctx);
+  if (memcmp(digest, header.sha1_file_hash, 20) != 0) {
+      fprintf(stderr, "huh?\n");
+      exit(1);
+  }
+  exit(0);
 }

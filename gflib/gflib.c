@@ -40,6 +40,7 @@ $Revision: 1.2 $
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "gflib.h"
 
 #define prim_poly_32 020000007
@@ -440,7 +441,8 @@ extern Condensed_Matrix *gf_condense_dispersal_matrix(
   return NULL;
 }
 
-static pic(int *inv, int *copy, int rows, char *s)
+static void 
+pic(int *inv, int *copy, int rows, char *s)
 {
   printf("\n%s\n\n", s);
   gf_fprint_matrix(stdout, inv, rows, rows);
