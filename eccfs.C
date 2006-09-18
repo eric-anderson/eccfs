@@ -22,12 +22,15 @@
 #include <errno.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include <LintelAssert.H>
 #include <StringUtil.H>
 #include <HashUnique.H>
 
 #include <openssl/sha.h>
+
+static const int reverify_interval_seconds = 3600*24;
 
 struct eccfs_args {
   char *eccdirs;
@@ -196,7 +199,7 @@ public:
 	int ret = close(fd);
 	if (ret != 0) {
 	    fprintf(stderr, "error closing %s: %s\n",
-		    path.c_str(), strerr(errno));
+		    path.c_str(), strerror(errno));
 	}
     }
     
@@ -217,12 +220,12 @@ public:
 	}
 	SHA1_Update(&ctx, &header, 4+20);
 	
-	const int bufsize = 1024*1024;
+	const unsigned bufsize = 1024*1024;
 	char buf[bufsize];
 	
 	while(blocksize > 0) {
 	    int remain = blocksize > bufsize ? bufsize : blocksize;
-	    int amt = read(fd, buf, remain);
+	    int amt = ::read(fd, buf, remain);
 	    if (amt != remain) {
 		fprintf(stderr, "Error or EOF while reading %s: %s\n",
 			path.c_str(), strerror(errno));
@@ -232,7 +235,7 @@ public:
 	    blocksize -= amt;
 	}
 
-	char digest[20];
+	unsigned char digest[20];
 	SHA1_Final(digest, &ctx);
 	if (memcmp(digest, header.sha1_chunk_hash, 20) != 0) {
 	    fprintf(stderr, "Digest mismatch while reading %s\n",
@@ -240,12 +243,11 @@ public:
 	    return false;
 	}
 	
-	last
 	return true;
     }
 
-    bool read_ecc_find_correct_chunk(int fd, string &path, unsigned &chunk_size,
-				     off_t offset) {
+    bool read_ecc_is_correct_chunk(int fd, string &path, unsigned &chunk_size,
+				   off_t offset) {
 	struct header tmp;
 	int ret = pread(fd, &tmp, sizeof(struct header), 0);
 	if (ret != sizeof(struct header)) {
@@ -256,23 +258,23 @@ public:
 	    struct stat buf;
 	    if (fstat(fd, &buf) != 0) {
 		fprintf(stderr, "error on stat of %s: %s\n",
-			path.c_str(), strerr(errno));
+			path.c_str(), strerror(errno));
 		return false;
 	    }
 		
+	    unsigned n = tmp.getn();
 	    unsigned long long orig_size = 
-		(unsigned long long)(buf.st_size-sizeof(struct header)) * n - header.under_size;
+		(unsigned long long)(buf.st_size-sizeof(struct header)) * n - tmp.under_size;
 	    unsigned long long sz = orig_size;
 	    if (sz % (n*sizeof(unsigned char)) != 0) {
 		sz += (n*sizeof(unsigned char) - (sz % (n*sizeof(unsigned char))));
 	    }
 	    unsigned long long blocksize = sz/n;
-	    if (blocksize != buf.st_size - sizeof(struct header)) {
+	    if (blocksize != (unsigned long long)(buf.st_size - sizeof(struct header))) {
 		fprintf(stderr, "huh confused blocksize on %s?\n", path.c_str());
 		return false;
 	    }
 	    
-	    unsigned n = tmp.getn();
 	    unsigned filenum = tmp.getfilenum();
 
 	    if (filenum >= n) {
@@ -285,7 +287,7 @@ public:
 	    }
 	    
 	    // right chunk; verify checksum...
-	    return read_ecc_verify_chunk_checksum(fd, path, blocksize);
+	    return read_ecc_verify_chunk_checksum(fd, path, tmp, blocksize);
 	}		
 	return false; 
     }
@@ -300,11 +302,13 @@ public:
 	    if (fd == -1) {
 		continue;
 	    }
-	    if (!read_ecc_getchunksize(fd, tmp, chunk_size)) {
+	    unsigned chunk_size = 0;
+	    if (!read_ecc_is_correct_chunk(fd, tmp, chunk_size, offset)) {
 		read_ecc_close(fd, tmp);
 	    }
-
+	    read_ecc_close(fd, tmp);
 	}
+	return -EINVAL;
     }
 
     int read(const string &path, char *buf, size_t size, 
@@ -553,7 +557,7 @@ extern "C"
 int eccfs_read(const char *path, char *buf, size_t size, off_t offset,
                     struct fuse_file_info *fi)
 {
-    return fs.read(path, buf, size, offset, fi);
+    return fs.read(path, buf, size, offset);
 }
 
 extern "C"
