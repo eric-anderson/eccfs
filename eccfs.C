@@ -62,6 +62,8 @@ struct header {
 using namespace std;
 
 static const string path_root("/");
+
+// TODO: rename all the functions fuse_...; the use of the same name in both cases is confusing
 class EccFS {
 public:
     void init(eccfs_args *args) {
@@ -177,19 +179,28 @@ public:
     int open(const string &path, struct fuse_file_info *fi) {
 	string tmp = importdir + path;
 	int fd = ::open(tmp.c_str(), fi->flags);
-	if (fd == -1 && fi->flags == O_RDONLY) { // Can't open backing bits for anything other than RDONLY.
-	    for(unsigned i = 0; i < eccdirs.size(); ++i) {
-		tmp = eccdirs[i] + path;
-		fd = ::open(tmp.c_str(), fi->flags);
-		if (fd != -1)
-		    break;
+	if (fd == -1) {
+	    if ((fi->flags & (O_RDONLY|O_LARGEFILE)) == fi->flags) { 
+		// Only open backing bits for RDONLY | LARGEFILE.
+		for(unsigned i = 0; i < eccdirs.size(); ++i) {
+		    tmp = eccdirs[i] + path;
+		    fd = ::open(tmp.c_str(), fi->flags);
+		    if (fd != -1)
+			break;
+		}
+		if (fd == -1) {
+		    return -errno;
+		}
+	    } else {
+		printf("Unable to open %s with flags 0x%x should be 0x%x\n", path.c_str(), 
+		       fi->flags, O_RDONLY | O_LARGEFILE);
+		return -EINVAL;
 	    }
-	    return -errno;
 	}
 	int ret = close(fd);
 	if (ret == -1) {
-	    fprintf(stderr, "Warning, close(%s) failed: %s\n", 
-		    path.c_str(), strerror(errno));
+	    fprintf(stderr, "Warning, close(%d from %s) failed: %s\n", 
+		    fd, path.c_str(), strerror(errno));
 	    return -EINVAL;
 	}
 	return 0;
@@ -198,11 +209,14 @@ public:
     void read_ecc_close(int fd, const string &path) {
 	int ret = close(fd);
 	if (ret != 0) {
-	    fprintf(stderr, "error closing %s: %s\n",
-		    path.c_str(), strerror(errno));
+	    fprintf(stderr, "error closing %d from %s: %s\n",
+		    fd, path.c_str(), strerror(errno));
 	}
     }
     
+    // Could have this function fill the read buffer on the way
+    // through or do the read explicitly if the recent verify rule is
+    // still true.
     bool read_ecc_verify_chunk_checksum(int fd, const string &path, 
 					struct header &header,
 					unsigned long long blocksize) {
@@ -223,16 +237,23 @@ public:
 	const unsigned bufsize = 1024*1024;
 	char buf[bufsize];
 	
-	while(blocksize > 0) {
-	    int remain = blocksize > bufsize ? bufsize : blocksize;
-	    int amt = ::read(fd, buf, remain);
-	    if (amt != remain) {
+	unsigned long long remain = blocksize;
+	while(remain > 0) {
+	    int read_amt = blocksize > bufsize ? bufsize : blocksize;
+	    int amt = ::read(fd, buf, read_amt);
+	    if (amt != read_amt) {
 		fprintf(stderr, "Error or EOF while reading %s: %s\n",
 			path.c_str(), strerror(errno));
 		return false;
 	    }
-	    SHA1_Update(&ctx, buf, remain);
-	    blocksize -= amt;
+	    SHA1_Update(&ctx, buf, read_amt);
+	    remain -= amt;
+	}
+	int amt = ::read(fd, buf, 1);
+	if (amt != 0) {
+	    fprintf(stderr, "Failed to get EOF from %s after reading %d + %d bytes\n", 
+		    path.c_str(), sizeof(struct header), blocksize);
+	    return false;
 	}
 
 	unsigned char digest[20];
@@ -249,7 +270,7 @@ public:
     bool read_ecc_is_correct_chunk(int fd, string &path, unsigned &chunk_size,
 				   off_t offset) {
 	struct header tmp;
-	int ret = pread(fd, &tmp, sizeof(struct header), 0);
+	int ret = ::read(fd, &tmp, sizeof(struct header));
 	if (ret != sizeof(struct header)) {
 	    return false;
 	    
@@ -298,14 +319,16 @@ public:
 	// find the right chunk...
 	for(unsigned i = 0; i < eccdirs.size(); ++i) {
 	    tmp = eccdirs[i] + path;
-	    int fd = open(tmp.c_str(), O_RDONLY);
+	    int fd = ::open(tmp.c_str(), O_RDONLY | O_LARGEFILE);
 	    if (fd == -1) {
 		continue;
 	    }
 	    unsigned chunk_size = 0;
 	    if (!read_ecc_is_correct_chunk(fd, tmp, chunk_size, offset)) {
 		read_ecc_close(fd, tmp);
+		continue;
 	    }
+	    printf("TODO: READ IT HERE\n");
 	    read_ecc_close(fd, tmp);
 	}
 	return -EINVAL;

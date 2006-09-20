@@ -36,7 +36,7 @@
 # $Revision: 1.2 $
 
 CC_GCC = gcc 
-CFLAGS_GCC = -O6 -march=pentium-m
+CFLAGS_GCC = -O6 -march=pentium4
 CC_ICC = /opt/intel/cc/9.0/bin/icc
 CFLAGS_ICC = -static -O3 -Qoption,c,-ip_ninl_max_stats=2000 -xB -ipo -fomit-frame-pointer 
 CC = huh-this-did-not-happen

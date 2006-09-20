@@ -152,12 +152,12 @@ main(int argc, char **argv)
 	if (ret != 1) { perror(buf_file); exit(1); }
 	if (getn(&header) != n || getm(&header) != m || 
 	    blocksize * n - header.under_size != orig_size ||
-	    getfilenum(&header) != i || 
+	    getchunknum(&header) != i || 
 	    header.version != 1) {
-	    fprintf(stderr,"huh header simple check failed %d != %d || %d != %d || %d * %d - %d != %d || %d != %d || %d != 1?",
+	    fprintf(stderr,"huh header simple check failed %d != %d || %d != %d || %d * %d - %d != %d || %d != %d || %d != 1?\n",
 		    getn(&header), n, getm(&header), m, 
 		    blocksize, n, header.under_size, orig_size,
-		    getfilenum(&header), i, 
+		    getchunknum(&header), i, 
 		    header.version);
 	    exit(1);
 	}

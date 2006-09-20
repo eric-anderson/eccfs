@@ -133,7 +133,7 @@ main(int argc, char **argv)
   for (i = 0; i < n; i++) {
       int ret;
       sprintf(buf_file, "%s-%04d.rs", stem, i);
-      setnmfilenum(&file_header, n,m,i);
+      setnmchunknum(&file_header, n,m,i);
       printf("Writing %s ...", buf_file); fflush(stdout);
       f = fopen(buf_file, "w");
       if (f == NULL) { perror(buf_file); exit(1); }
@@ -161,7 +161,7 @@ main(int argc, char **argv)
       int ret;
       sprintf(buf_file, "%s-%04d.rs", stem, i);
       printf("Calculating  %s ...", buf_file); fflush(stdout);
-      setnmfilenum(&file_header, n,m,i);
+      setnmchunknum(&file_header, n,m,i);
       memset(block, 0, blocksize); 
       for (j = 0; j < cols; j++) {
 	  tmp = vdm[i*cols+j]; 
