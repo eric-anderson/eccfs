@@ -64,7 +64,6 @@ using namespace std;
 
 static const string path_root("/");
 
-// TODO: rename all the functions fuse_...; the use of the same name in both cases is confusing
 class EccFS {
 public:
     void init(eccfs_args *args) {
@@ -82,7 +81,7 @@ public:
 	}
     }
 
-    int getattr(const string &path, struct stat *stbuf) {
+    int fuse_getattr(const string &path, struct stat *stbuf) {
 	// cout << "getattr(" << path << ");\n";
 	// TODO: get stats from multiple places and cross verify
 	string tmp = importdir + path;
@@ -98,14 +97,14 @@ public:
 	    cout << "lstat-try(" << tmp << ")\n";
 	    ret = lstat(tmp.c_str(), stbuf);
 	    if (ret == 0) {
-		int fd = ::open(tmp.c_str(), O_RDONLY | O_LARGEFILE);
+		int fd = open(tmp.c_str(), O_RDONLY | O_LARGEFILE);
 		if (fd == -1) {
 		    errno = EINVAL;
 		    goto bad;
 		}
 
 		struct header tmp;
-		ssize_t ret = ::read(fd, &tmp, sizeof(struct header));
+		ssize_t ret = read(fd, &tmp, sizeof(struct header));
 		if (ret != sizeof(struct header)) {
 		    goto close_bad;
 		}
@@ -129,7 +128,7 @@ public:
 		    }
 		    
 		    stbuf->st_size = orig_size;
-		    ret = ::close(fd);
+		    ret = close(fd);
 		    if (ret != 0) {
 			fprintf(stderr, "Warning, error on close: %s\n", strerror(errno));
 		    }
@@ -138,7 +137,7 @@ public:
 		}
 
 	    close_bad:
-		ret = ::close(fd);
+		ret = close(fd);
 		if (ret != 0) {
 		    fprintf(stderr, "Warning, error on close: %s\n", strerror(errno));
 		}
@@ -175,7 +174,7 @@ public:
 	struct stat tmp;
 	memset(&tmp, 0, sizeof(tmp));
 	struct dirent *ent;
-	while (NULL != (ent = ::readdir(dir))) {
+	while (NULL != (ent = readdir(dir))) {
 	    if (debug_readdir_partial > 1) cout << "readdir_partial(" << path << "): file " << ent->d_name << ": ";
 	    string d_name(ent->d_name);
 	    if (unique.exists(d_name)) {
@@ -199,7 +198,7 @@ public:
 	return 0;
     }
 
-    int readdir(const string &path, void *buf, fuse_fill_dir_t filler,
+    int fuse_readdir(const string &path, void *buf, fuse_fill_dir_t filler,
 		off_t offset, struct fuse_file_info *fi) {
 	cout << "readdir(" << path << "," << offset << ");\n";
 	AssertAlways(offset == 0, ("Unimplemented offset = %lld, but does not seem to be a problem, tested with 35855 files in a directory", (long long)offset));
@@ -222,15 +221,15 @@ public:
     // then while the file is open someone else writes the same
     // filename; in that case, when we do later read() bits, we will
     // pull from the written bit, not the backing file
-    int open(const string &path, struct fuse_file_info *fi) {
+    int fuse_open(const string &path, struct fuse_file_info *fi) {
 	string tmp = importdir + path;
-	int fd = ::open(tmp.c_str(), fi->flags);
+	int fd = open(tmp.c_str(), fi->flags);
 	if (fd == -1) {
 	    if ((fi->flags & (O_RDONLY|O_LARGEFILE)) == fi->flags) { 
 		// Only open backing bits for RDONLY | LARGEFILE.
 		for(unsigned i = 0; i < eccdirs.size(); ++i) {
 		    tmp = eccdirs[i] + path;
-		    fd = ::open(tmp.c_str(), fi->flags);
+		    fd = open(tmp.c_str(), fi->flags);
 		    if (fd != -1)
 			break;
 		}
@@ -286,7 +285,7 @@ public:
 	unsigned long long remain = blocksize;
 	while(remain > 0) {
 	    int read_amt = blocksize > bufsize ? bufsize : blocksize;
-	    int amt = ::read(fd, buf, read_amt);
+	    int amt = read(fd, buf, read_amt);
 	    if (amt != read_amt) {
 		fprintf(stderr, "Error or EOF while reading %s: %s\n",
 			path.c_str(), strerror(errno));
@@ -295,7 +294,7 @@ public:
 	    SHA1_Update(&ctx, buf, read_amt);
 	    remain -= amt;
 	}
-	int amt = ::read(fd, buf, 1);
+	int amt = read(fd, buf, 1);
 	if (amt != 0) {
 	    fprintf(stderr, "Failed to get EOF from %s after reading %d + %d bytes\n", 
 		    path.c_str(), sizeof(struct header), blocksize);
@@ -319,7 +318,7 @@ public:
 			      char *buf, off_t offset, 
 			      size_t size, unsigned long long &orig_size) {
 	struct header tmp;
-	ssize_t ret = ::read(fd, &tmp, sizeof(struct header));
+	ssize_t ret = read(fd, &tmp, sizeof(struct header));
 	if (ret != sizeof(struct header)) {
 	    if (debug_read) fprintf(stderr, "ERR-shortheader\n");
 	    return -1;
@@ -378,7 +377,7 @@ public:
 	if ((unsigned long long)(offset + chunk_read_size) > orig_size) {
 	    chunk_read_size = orig_size - offset;
 	}
-	ret = ::pread(fd, buf, chunk_read_size, chunk_offset + sizeof(struct header));
+	ret = pread(fd, buf, chunk_read_size, chunk_offset + sizeof(struct header));
 	if (ret != (ssize_t)chunk_read_size) {
 	    fprintf(stderr, "error on read from %s (%lld != %lld): %s",
 		    path.c_str(), (long long)ret, (long long)chunk_read_size,
@@ -408,7 +407,7 @@ public:
 		if (debug_read) {
 		    fprintf(stderr, "    Read ecc chunk %s: ", path.c_str());
 		}
-		int fd = ::open(tmp.c_str(), O_RDONLY | O_LARGEFILE);
+		int fd = open(tmp.c_str(), O_RDONLY | O_LARGEFILE);
 		if (fd == -1) {
 		    if (debug_read) fprintf(stderr, "ERR-unopenable\n");
 		    continue;
@@ -447,13 +446,13 @@ public:
 	return -EINVAL;
     }
 
-    int read(const string &path, char *buf, size_t size, 
+    int fuse_read(const string &path, char *buf, size_t size, 
 	     off_t offset) {
 	if (debug_read) {
 	    printf("\n");
 	}
 	string tmp = importdir + path;
-	int fd = ::open(tmp.c_str(), O_RDONLY);
+	int fd = open(tmp.c_str(), O_RDONLY);
 	if (fd == -1) {
 	    return read_ecc(path, buf, size, offset);
 	}
@@ -484,7 +483,7 @@ static struct fuse_opt eccfs_opts[] = {
 extern "C"
 int eccfs_getattr(const char *path, struct stat *stbuf)
 {
-    return fs.getattr(path, stbuf);
+    return fs.fuse_getattr(path, stbuf);
 }
 
 extern "C"
@@ -521,7 +520,7 @@ extern "C"
 int eccfs_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 		  off_t offset, struct fuse_file_info *fi)
 {
-    return fs.readdir(path, buf, filler, offset, fi);
+    return fs.fuse_readdir(path, buf, filler, offset, fi);
 }
 
 extern "C"
@@ -691,14 +690,14 @@ int eccfs_utime(const char *path, struct utimbuf *buf)
 extern "C"
 int eccfs_open(const char *path, struct fuse_file_info *fi)
 {
-    return fs.open(path,fi);
+    return fs.fuse_open(path,fi);
 }
 
 extern "C"
 int eccfs_read(const char *path, char *buf, size_t size, off_t offset,
                     struct fuse_file_info *fi)
 {
-    return fs.read(path, buf, size, offset);
+    return fs.fuse_read(path, buf, size, offset);
 }
 
 extern "C"

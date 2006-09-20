@@ -39,7 +39,7 @@ find(\&wanted, $importdir);
 rmdir($encodedir) or die "Can't rmdir $encodedir: $!";
 rmdir($decodedir) or die "Can't rmdir $decodedir: $!";
 
-print "TODO: reverify files and clear out import...\n";
+print "TODO: reverify files after copy to ecc dirs, verify proper decode through eccfs, and clear out import...\n";
 %Global::reverify_directories if 0;
 %Global::reverify_files if 0;
 exit(0);
