@@ -37,6 +37,7 @@ my $decodedir = "$workbase/decode";
 mkdir($decodedir, 0770) or die "Can't mkdir $decodedir: $!";
 find(\&wanted, $importdir);
 rmdir($encodedir) or die "Can't rmdir $encodedir: $!";
+rmdir($decodedir) or die "Can't rmdir $decodedir: $!";
 
 print "TODO: reverify files and clear out import...\n";
 %Global::reverify_directories if 0;
@@ -233,6 +234,7 @@ sub verifyEccSplitup {
     my $under_size = $rounded_size - $size;
     die "??" unless $under_size >= 0 && $under_size < 256;
 
+    print "TODO: VERIFY that sha1 of chunks read together add up to sha1 of orig file\n";
     for(my $i=0; $i < @$files; ++$i) {
 	verifyFile($i, $under_size, $rounded_size / $n, $n, $m, $file_digest, $files->[$i]);
     }

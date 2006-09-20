@@ -31,6 +31,7 @@
 #include <openssl/sha.h>
 
 static const int reverify_interval_seconds = 3600*24;
+static const bool debug_read = true;
 
 struct eccfs_args {
   char *eccdirs;
@@ -97,7 +98,52 @@ public:
 	    cout << "lstat-try(" << tmp << ")\n";
 	    ret = lstat(tmp.c_str(), stbuf);
 	    if (ret == 0) {
-		goto ok;
+		int fd = ::open(tmp.c_str(), O_RDONLY | O_LARGEFILE);
+		if (fd == -1) {
+		    errno = EINVAL;
+		    goto bad;
+		}
+
+		struct header tmp;
+		ssize_t ret = ::read(fd, &tmp, sizeof(struct header));
+		if (ret != sizeof(struct header)) {
+		    goto close_bad;
+		}
+
+		if (tmp.version != 1) {
+		    goto close_bad;
+		}
+
+		{
+		    unsigned n = tmp.getn();
+		    unsigned long long orig_size = 
+			(unsigned long long)(stbuf->st_size-sizeof(struct header)) * n - tmp.under_size;
+		    unsigned long long sz = orig_size;
+		    if (sz % (n*sizeof(unsigned char)) != 0) {
+			sz += (n*sizeof(unsigned char) - (sz % (n*sizeof(unsigned char))));
+		    }
+		    unsigned long long blocksize = sz/n;
+		    if (blocksize != (unsigned long long)(stbuf->st_size - sizeof(struct header))) {
+			fprintf(stderr, "huh confused blocksize on %s?\n", path.c_str());
+			goto close_bad;
+		    }
+		    
+		    stbuf->st_size = orig_size;
+		    ret = ::close(fd);
+		    if (ret != 0) {
+			fprintf(stderr, "Warning, error on close: %s\n", strerror(errno));
+		    }
+	    
+		    goto ok;
+		}
+
+	    close_bad:
+		ret = ::close(fd);
+		if (ret != 0) {
+		    fprintf(stderr, "Warning, error on close: %s\n", strerror(errno));
+		}
+		errno = EINVAL;
+		goto bad;
 	    }
 	    if (ret != -1 || errno != ENOENT) {
 		goto bad;
@@ -267,81 +313,153 @@ public:
 	return true;
     }
 
-    bool read_ecc_is_correct_chunk(int fd, string &path, unsigned &chunk_size,
-				   off_t offset) {
+    // Returns amount read or -1 on skipping of chunk
+    ssize_t 
+    read_ecc_if_correct_chunk(int fd, string &path, 
+			      char *buf, off_t offset, 
+			      size_t size, unsigned long long &orig_size) {
 	struct header tmp;
-	int ret = ::read(fd, &tmp, sizeof(struct header));
+	ssize_t ret = ::read(fd, &tmp, sizeof(struct header));
 	if (ret != sizeof(struct header)) {
-	    return false;
+	    if (debug_read) fprintf(stderr, "ERR-shortheader\n");
+	    return -1;
 	    
 	}
-	if (tmp.version == 1) {
-	    struct stat buf;
-	    if (fstat(fd, &buf) != 0) {
-		fprintf(stderr, "error on stat of %s: %s\n",
-			path.c_str(), strerror(errno));
-		return false;
+	if (tmp.version != 1) {
+	    if (debug_read) fprintf(stderr, "ERR-unknownversion\n");
+	    return -1; 
+	}
+	 
+	struct stat stat_buf;
+	if (fstat(fd, &stat_buf) != 0) {
+	    fprintf(stderr, "error on stat of %s: %s\n",
+		    path.c_str(), strerror(errno));
+	    return -1;
+	}
+	
+	unsigned n = tmp.getn();
+	orig_size = 
+	    (unsigned long long)(stat_buf.st_size-sizeof(struct header)) * n - tmp.under_size;
+	unsigned long long sz = orig_size;
+	if (sz % (n*sizeof(unsigned char)) != 0) {
+	    sz += (n*sizeof(unsigned char) - (sz % (n*sizeof(unsigned char))));
+	}
+	unsigned long long blocksize = sz/n;
+	if (blocksize != (unsigned long long)(stat_buf.st_size - sizeof(struct header))) {
+	    fprintf(stderr, "huh confused blocksize on %s?\n", path.c_str());
+	    return -1;
+	}
+	
+	unsigned filenum = tmp.getfilenum();
+	
+	if (filenum >= n) {
+	    if (debug_read) fprintf(stderr, "SKIP - ecc-chunk\n");
+	    return -1; // ecc chunk, ignorable
+	}
+	unsigned chunknum = offset / blocksize;
+	
+	if (chunknum != filenum) {
+	    if (debug_read) fprintf(stderr, "SKIP - wrong-chunk\n");
+	    return -1; // wrong chunk
+	}
+	
+	// right chunk; verify checksum...
+	if (!read_ecc_verify_chunk_checksum(fd, path, tmp, blocksize)) {
+	    if (debug_read) fprintf(stderr, "SKIP - no verify\n");
+	    return -1;
 	    }
-		
-	    unsigned n = tmp.getn();
-	    unsigned long long orig_size = 
-		(unsigned long long)(buf.st_size-sizeof(struct header)) * n - tmp.under_size;
-	    unsigned long long sz = orig_size;
-	    if (sz % (n*sizeof(unsigned char)) != 0) {
-		sz += (n*sizeof(unsigned char) - (sz % (n*sizeof(unsigned char))));
-	    }
-	    unsigned long long blocksize = sz/n;
-	    if (blocksize != (unsigned long long)(buf.st_size - sizeof(struct header))) {
-		fprintf(stderr, "huh confused blocksize on %s?\n", path.c_str());
-		return false;
-	    }
-	    
-	    unsigned filenum = tmp.getfilenum();
-
-	    if (filenum >= n) {
-		return false; // ecc chunk, ignorable
-	    }
-	    unsigned chunknum = offset / blocksize;
-	    
-	    if (chunknum != filenum) {
-		return false; // wrong chunk
-	    }
-	    
-	    // right chunk; verify checksum...
-	    return read_ecc_verify_chunk_checksum(fd, path, tmp, blocksize);
-	}		
-	return false; 
+	
+	off_t chunk_offset = offset - chunknum * blocksize;
+	
+	size_t chunk_read_size = size;
+	if ((unsigned long long)(chunk_offset + chunk_read_size) > blocksize) {
+	    chunk_read_size = blocksize - chunk_offset;
+	}
+	if ((unsigned long long)(offset + chunk_read_size) > orig_size) {
+	    chunk_read_size = orig_size - offset;
+	}
+	ret = ::pread(fd, buf, chunk_read_size, chunk_offset + sizeof(struct header));
+	if (ret != (ssize_t)chunk_read_size) {
+	    fprintf(stderr, "error on read from %s (%lld != %lld): %s",
+		    path.c_str(), (long long)ret, (long long)chunk_read_size,
+		    strerror(errno));
+	    return -1;
+	}
+	if (debug_read) fprintf(stderr, "SUCCESS, read %lld bytes\n", 
+				    (long long)chunk_read_size);
+	return chunk_read_size;
     }
 
     int read_ecc(const string &path, char *buf, size_t size, 
 		 off_t offset) {
 	string tmp;
-	// find the right chunk...
-	for(unsigned i = 0; i < eccdirs.size(); ++i) {
-	    tmp = eccdirs[i] + path;
-	    int fd = ::open(tmp.c_str(), O_RDONLY | O_LARGEFILE);
-	    if (fd == -1) {
-		continue;
+
+	size_t remain_size = size;
+
+	while(remain_size > 0) {
+	    size_t prev_remain_size = remain_size;
+	    if (debug_read) {
+		fprintf(stderr, "  Read loop %s off=%lld size=%lld remain_size=%lld\n",
+			path.c_str(), (long long)offset, (long long)size, (long long)remain_size);
 	    }
-	    unsigned chunk_size = 0;
-	    if (!read_ecc_is_correct_chunk(fd, tmp, chunk_size, offset)) {
+	    // find the right chunk...
+	    for(unsigned i = 0; i < eccdirs.size(); ++i) {
+		tmp = eccdirs[i] + path;
+		if (debug_read) {
+		    fprintf(stderr, "    Read ecc chunk %s: ", path.c_str());
+		}
+		int fd = ::open(tmp.c_str(), O_RDONLY | O_LARGEFILE);
+		if (fd == -1) {
+		    if (debug_read) fprintf(stderr, "ERR-unopenable\n");
+		    continue;
+		}
+		unsigned long long orig_size;
+		ssize_t amt_read = read_ecc_if_correct_chunk(fd, tmp, buf, offset, 
+							     remain_size, orig_size);
+		if (amt_read >= 0) {
+		    offset += amt_read;
+		    remain_size -= amt_read;
+		    buf += amt_read;
+		    if (debug_read) {
+			fprintf(stderr, "    Success read %lld offset=%lld, remain_size=%lld\n",
+				(long long)amt_read, offset, (long long)remain_size);
+		    }
+		    if ((unsigned long long)offset == orig_size) {
+			// Asked to read more than is present in the file...
+			size -= remain_size;
+			remain_size = 0;
+		    }
+		    break;
+		}
 		read_ecc_close(fd, tmp);
-		continue;
 	    }
-	    printf("TODO: READ IT HERE\n");
-	    read_ecc_close(fd, tmp);
+	    if (prev_remain_size == remain_size) {
+		fprintf(stderr, "Internal, size remaining didn't drop after read\n");
+		return -EINVAL;
+	    }
+	}
+	if (remain_size == 0) {
+	    if (debug_read) {
+		printf("successfully read %d bytes\n", (int)size);
+	    }
+	    return size;
 	}
 	return -EINVAL;
     }
 
     int read(const string &path, char *buf, size_t size, 
 	     off_t offset) {
+	if (debug_read) {
+	    printf("\n");
+	}
 	string tmp = importdir + path;
 	int fd = ::open(tmp.c_str(), O_RDONLY);
 	if (fd == -1) {
 	    return read_ecc(path, buf, size, offset);
 	}
-	cout << "read-import " << path << " bytes " << size << " offset " << offset << "\n";
+	if (debug_read) {
+	    cout << "read-import " << path << " bytes " << size << " offset " << offset << "\n";
+	}
 	int ret = pread(fd, buf, size, offset);
 	if (ret == -1) {
 	    return -errno;
