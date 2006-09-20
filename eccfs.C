@@ -64,6 +64,14 @@ using namespace std;
 
 static const string path_root("/");
 
+bool
+prefixequal(const string &str, const string &prefix)
+{
+    return str.compare(0,prefix.size(),prefix) == 0;
+}
+
+static string force_ecc_directory("/.force-ecc");
+static string force_ecc_prefix("/.force-ecc/");
 class EccFS {
 public:
     void init(eccfs_args *args) {
@@ -81,21 +89,14 @@ public:
 	}
     }
 
-    int fuse_getattr(const string &path, struct stat *stbuf) {
-	// cout << "getattr(" << path << ");\n";
-	// TODO: get stats from multiple places and cross verify
-	string tmp = importdir + path;
-	int ret = lstat(tmp.c_str(), stbuf);
-	if (ret == 0) {
-	    goto ok;
-	}
-	if (errno != ENOENT) {
-	    goto bad;
-	}
+    int getattr_ecc(const string &path, struct stat *stbuf) {
+	string tmp;
+
+
 	for(unsigned i = 0; i < eccdirs.size(); ++i) {
 	    tmp = eccdirs[i] + path;
 	    cout << "lstat-try(" << tmp << ")\n";
-	    ret = lstat(tmp.c_str(), stbuf);
+	    int ret = lstat(tmp.c_str(), stbuf);
 	    if (ret == 0) {
 		int fd = open(tmp.c_str(), O_RDONLY | O_LARGEFILE);
 		if (fd == -1) {
@@ -148,17 +149,47 @@ public:
 		goto bad;
 	    }
 	}
+
 	cout << "getattr(" << path << ") ERROR: not found anywhere\n";
 	return -ENOENT;
+	
     bad:
 	cout << "weird error getattr(" << path << ") ERROR " << errno << ";" << strerror(errno) << "\n";
 	
 	return -errno;
-	
     ok:
 	stbuf->st_dev = 0;
 	stbuf->st_ino = 0;
 	return 0;
+
+    }
+
+    int fuse_getattr(const string &path, struct stat *stbuf) {
+	if (path == force_ecc_directory) {
+	    return fuse_getattr("/", stbuf); // works as well as anything else...
+	}
+	if (prefixequal(path, force_ecc_prefix)) {
+	    string subpath(path, force_ecc_prefix.size() - 1);
+	    fprintf(stderr, "force ecc prefix %s -> %s\n", path.c_str(), subpath.c_str());
+	    return getattr_ecc(subpath, stbuf);
+	}
+	// cout << "getattr(" << path << ");\n";
+	// TODO: get stats from multiple places and cross verify
+	string tmp = importdir + path;
+	int ret = lstat(tmp.c_str(), stbuf);
+	if (ret == 0) {
+	    stbuf->st_dev = 0;
+	    stbuf->st_ino = 0;
+	    return 0;
+	}
+
+	if (errno != ENOENT) {
+	    cout << "weird error getattr(" << path << ") ERROR " << errno << ";" << strerror(errno) << "\n";
+	
+	    return -errno;
+	}
+
+	return getattr_ecc(path, stbuf);
     }
 
     static const int debug_readdir_partial = 1;
@@ -200,6 +231,8 @@ public:
 
     int fuse_readdir(const string &path, void *buf, fuse_fill_dir_t filler,
 		off_t offset, struct fuse_file_info *fi) {
+	// TODO: decide whether if we are doing a readdir on / if we should include
+	// force_ecc_directory in the list of returned strings
 	cout << "readdir(" << path << "," << offset << ");\n";
 	AssertAlways(offset == 0, ("Unimplemented offset = %lld, but does not seem to be a problem, tested with 35855 files in a directory", (long long)offset));
 	
@@ -217,30 +250,45 @@ public:
 	return 0;
     }
 
+    int open_ecc(const string &path, struct fuse_file_info *fi) {
+	if ((fi->flags & (O_RDONLY|O_LARGEFILE)) == fi->flags) { 
+	    // Only open backing bits for RDONLY | LARGEFILE.
+	    int fd = -1;
+	    for(unsigned i = 0; i < eccdirs.size(); ++i) {
+		string tmp = eccdirs[i] + path;
+		fd = open(tmp.c_str(), fi->flags);
+		if (fd != -1) { // ugly duplication with fuse_open :(
+		    int ret = close(fd);
+		    if (ret == -1) {
+			fprintf(stderr, "Warning, close(%d from %s) failed: %s\n", 
+				fd, path.c_str(), strerror(errno));
+			return -EINVAL;
+		    }
+		    return 0;
+		}
+	    }
+	    return -errno;
+	} else {
+	    printf("Unable to open %s with flags 0x%x should be 0x%x\n", path.c_str(), 
+		   fi->flags, O_RDONLY | O_LARGEFILE);
+	    return -EINVAL;
+	}
+    }
+
     // May want to think about the problem of opening the file and
     // then while the file is open someone else writes the same
     // filename; in that case, when we do later read() bits, we will
     // pull from the written bit, not the backing file
     int fuse_open(const string &path, struct fuse_file_info *fi) {
+	if (prefixequal(path, force_ecc_prefix)) {
+	    string subpath(path, force_ecc_prefix.size() - 1);
+	    fprintf(stderr, "force ecc prefix %s -> %s\n", path.c_str(), subpath.c_str());
+	    return open_ecc(subpath, fi);
+	}
 	string tmp = importdir + path;
 	int fd = open(tmp.c_str(), fi->flags);
 	if (fd == -1) {
-	    if ((fi->flags & (O_RDONLY|O_LARGEFILE)) == fi->flags) { 
-		// Only open backing bits for RDONLY | LARGEFILE.
-		for(unsigned i = 0; i < eccdirs.size(); ++i) {
-		    tmp = eccdirs[i] + path;
-		    fd = open(tmp.c_str(), fi->flags);
-		    if (fd != -1)
-			break;
-		}
-		if (fd == -1) {
-		    return -errno;
-		}
-	    } else {
-		printf("Unable to open %s with flags 0x%x should be 0x%x\n", path.c_str(), 
-		       fi->flags, O_RDONLY | O_LARGEFILE);
-		return -EINVAL;
-	    }
+	    return open_ecc(path, fi);
 	}
 	int ret = close(fd);
 	if (ret == -1) {
@@ -450,6 +498,11 @@ public:
 	     off_t offset) {
 	if (debug_read) {
 	    printf("\n");
+	}
+	if (prefixequal(path, force_ecc_prefix)) {
+	    string subpath(path, force_ecc_prefix.size() - 1);
+	    fprintf(stderr, "force ecc prefix %s -> %s\n", path.c_str(), subpath.c_str());
+	    return read_ecc(subpath, buf, size, offset);
 	}
 	string tmp = importdir + path;
 	int fd = open(tmp.c_str(), O_RDONLY);
