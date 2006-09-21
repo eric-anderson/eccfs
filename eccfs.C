@@ -332,11 +332,11 @@ public:
 	
 	unsigned long long remain = blocksize;
 	while(remain > 0) {
-	    int read_amt = blocksize > bufsize ? bufsize : blocksize;
+	    int read_amt = remain > bufsize ? bufsize : remain;
 	    int amt = read(fd, buf, read_amt);
 	    if (amt != read_amt) {
-		fprintf(stderr, "Error or EOF while reading %s: %s\n",
-			path.c_str(), strerror(errno));
+		fprintf(stderr, "Error or EOF while reading %s (%d != %d; %lld remain %lld blocksize): %s\n",
+			path.c_str(), amt, read_amt, remain, blocksize, strerror(errno));
 		return false;
 	    }
 	    SHA1_Update(&ctx, buf, read_amt);
