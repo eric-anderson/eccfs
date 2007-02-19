@@ -36,7 +36,7 @@
 # $Revision: 1.2 $
 
 CC_GCC = gcc 
-CFLAGS_GCC = -O6 -march=pentium4
+CFLAGS_GCC = -O3 -g -march=pentium-m
 CC_ICC = /opt/intel/cc/9.0/bin/icc
 CFLAGS_ICC = -static -O3 -Qoption,c,-ip_ninl_max_stats=2000 -xB -ipo -fomit-frame-pointer 
 CC = huh-this-did-not-happen
@@ -76,6 +76,15 @@ help:
 
 # +mkmake+ -- Everything after this line is automatically generated
 
+check: rs_encode_file rs_decode_file
+	set -e; for i in rs_encode_file rs_decode_file *.[ch]; do \
+		echo "testing $$i"; \
+		./rs_encode_file $$i 7 3 test; \
+		rm test-0000.rs test-0001.rs test-0002.rs; \
+		./rs_decode_file test >test.decode; \
+		cmp $$i test.decode; \
+	done
+	rm test.decode test*rs
 
 clean:
 	rm -f core *.o $(ALL) a.out

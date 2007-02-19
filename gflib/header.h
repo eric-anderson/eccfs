@@ -1,9 +1,21 @@
+// Chunk hash verifies everything in this chunk except for itself
+
+// Cross-chunk hash verifies everything in all chunks except for the
+// chunk hash and the crosschunk hash
+
+// File hash verifies the underlying data of the file
+
 struct header {
     unsigned char version;
     unsigned char under_size;
     unsigned char n_m_chunknum_a; // 5 bits: n, 5 bits: m, 6 bits: chunknum
     unsigned char n_m_chunknum_b;
     unsigned char sha1_file_hash[20];
+    // crosschunk_hash = SHA1(header_incl_file_hash[0], SHA1(chunk_data[0]), ...)
+    unsigned char sha1_crosschunk_hash[20]; 
+    // chunk_hash calculated as SHA1(header,SHA1(data))
+    // This is done because the ecc calculation destroys the underlying data
+    // buffers
     unsigned char sha1_chunk_hash[20];
 };
 

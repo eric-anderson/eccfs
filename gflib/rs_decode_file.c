@@ -65,7 +65,7 @@ main(int argc, char **argv)
   struct header header;
   int ret;
   SHA_CTX ctx;
-  unsigned char digest[20];
+  unsigned char digest[20], crosschunk_hash[20];
 
   if (argc != 2) {
     fprintf(stderr, "usage: rs_decode_file stem\n");
@@ -136,51 +136,69 @@ main(int argc, char **argv)
   // don't trust SHA1.
 
   for (i = 0; i < rows && j < cols; i++) {
-    sprintf(buf_file, "%s-%04d.rs", stem, i);
-    if (stat(buf_file, &buf) != 0) {
-      fprintf(stderr, "can't find %s\n", buf_file);
-      map[i] = -1;
-    } else {
-      if ((buf.st_size-sizeof(struct header)) != blocksize) {
-	fprintf(stderr, "Ignoring file %s, wrong size\n", buf_file);
-        map[i] = -1;
+      sprintf(buf_file, "%s-%04d.rs", stem, i);
+      if (stat(buf_file, &buf) != 0) {
+	  fprintf(stderr, "can't find %s\n", buf_file);
+	  map[i] = -1;
       } else {
-        map[i] = j++;
-        f = fopen(buf_file, "r");
-        if (f == NULL) { perror(buf_file); exit(1); }
-	ret = fread(&header, sizeof(struct header), 1, f);
-	if (ret != 1) { perror(buf_file); exit(1); }
-	if (getn(&header) != n || getm(&header) != m || 
-	    blocksize * n - header.under_size != orig_size ||
-	    getchunknum(&header) != i || 
-	    header.version != 1) {
-	    fprintf(stderr,"huh header simple check failed %d != %d || %d != %d || %d * %d - %d != %d || %d != %d || %d != 1?\n",
-		    getn(&header), n, getm(&header), m, 
-		    blocksize, n, header.under_size, orig_size,
-		    getchunknum(&header), i, 
-		    header.version);
-	    exit(1);
-	}
-        k = fread(buffer[map[i]], 1, blocksize, f);
-        if (k != blocksize) {
-          fprintf(stderr, "%s -- stat says %d bytes, but only read %d\n", 
-             buf_file, buf.st_size, k);
-          exit(1);
-        }
-	SHA1_Init(&ctx);
-	if (sizeof(header) != 4+20+20) {
-	    fprintf(stderr, "Header size mismatch\n");
-	    abort();
-	}
-	SHA1_Update(&ctx, &header, 4+20);
-	SHA1_Update(&ctx, buffer[map[i]], blocksize);
-	SHA1_Final(digest, &ctx);
-	if (memcmp(digest, header.sha1_chunk_hash, 20) != 0) {
-	    fprintf(stderr, "huh?\n");
-	    exit(1);
-	}
+	  if ((buf.st_size-sizeof(struct header)) != blocksize) {
+	      fprintf(stderr, "Ignoring file %s, wrong size\n", buf_file);
+	      map[i] = -1;
+	  } else {
+	      map[i] = j;
+	      f = fopen(buf_file, "r");
+	      if (f == NULL) { perror(buf_file); exit(1); }
+	      ret = fread(&header, sizeof(struct header), 1, f);
+	      if (ret != 1) { perror(buf_file); exit(1); }
+	      if (getn(&header) != n || getm(&header) != m || 
+		  blocksize * n - header.under_size != orig_size ||
+		  getchunknum(&header) != i || 
+		  header.version != 1) {
+		  fprintf(stderr,"huh header simple check failed %d != %d || %d != %d || %d * %d - %d != %d || %d != %d || %d != 1?\n",
+			  getn(&header), n, getm(&header), m, 
+			  blocksize, n, header.under_size, orig_size,
+			  getchunknum(&header), i, 
+			  header.version);
+		  exit(1);
+	      }
+
+	      if (j == 0) {
+		  memcpy(crosschunk_hash, header.sha1_crosschunk_hash, 20);
+	      }
+	      if (memcmp(crosschunk_hash, header.sha1_crosschunk_hash, 20) != 0) {
+		  fprintf(stderr, "Crosschunk hash mismatch\n");
+		  abort();
+	      }
+	      k = fread(buffer[map[i]], 1, blocksize, f);
+	      if (k != blocksize) {
+		  fprintf(stderr, "%s -- stat says %d bytes, but only read %d\n", 
+			  buf_file, buf.st_size, k);
+		  exit(1);
+	      }
+
+	      if (sizeof(header) != 4+3*20) {
+		  fprintf(stderr, "Header size mismatch\n");
+		  abort();
+	      }
+	      {
+		  char tmpbuf[20];
+		  SHA1_Init(&ctx);
+		  SHA1_Update(&ctx, buffer[map[i]], blocksize);
+		  SHA1_Final(tmpbuf, &ctx);
+
+		  SHA1_Init(&ctx);
+		  SHA1_Update(&ctx, &header, 4+20+20);
+		  SHA1_Update(&ctx, tmpbuf, 20);
+		  SHA1_Final(digest, &ctx);
+
+		  if (memcmp(digest, header.sha1_chunk_hash, 20) != 0) {
+		      fprintf(stderr, "huh? chunk hash did not verify\n");
+		      exit(1);
+		  }
+	      }
+	      ++j;
+	  }
       }
-    }
   }
 
   if (j < cols) {

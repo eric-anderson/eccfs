@@ -40,6 +40,7 @@ $Revision: 1.2 $
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include "gflib.h"
 #include <sys/time.h>
 #include <sys/types.h>
@@ -50,6 +51,49 @@ $Revision: 1.2 $
 
 #include "header.h"
 
+FILE *
+openFile(char *stem, int i)
+{
+    char buf_file[PATH_MAX]; 
+
+    FILE *f;
+    sprintf(buf_file, "%s-%04d.rs", stem, i);
+
+    f = fopen(buf_file, "w+");
+    if (f == NULL) { perror(buf_file); exit(1); }
+    int ret = fseek(f, 0, SEEK_SET);
+    return f;
+}
+
+void 
+writeBuffer(FILE *f, int i, struct header *header, 
+	    char *buffer, int blocksize)
+{
+    SHA_CTX ctx;
+    int ret;
+
+    printf("Writing buffer for fragment %d ...", i);
+    fflush(stdout);
+
+    SHA1_Init(&ctx);
+    // SHA1_Update(&ctx, header, offsetof(struct header, sha1_chunk_hash));
+    SHA1_Update(&ctx, buffer, blocksize);
+    // Not the final chunk hash, see header.h for explanation
+    SHA1_Final(header->sha1_chunk_hash, &ctx); 
+    
+    // eliminate valgrind warning; we will fix this later, but it's
+    // better to get a clean run
+    memset(header->sha1_crosschunk_hash, '\0', 20);
+
+    ret = fseek(f, 0, SEEK_SET);
+    if (ret != 0) { abort(); };
+    ret = fwrite(header, 1, sizeof(*header), f);
+    if (ret != sizeof(*header)) { perror("header write failed"); exit(1); }
+    ret = fwrite(buffer, 1, blocksize, f);
+    if (ret != blocksize) { perror("buffer write failed"); exit(1); }
+    printf(" Done\n");
+}
+
 /* This one is going to be in-core */
 
 int
@@ -59,11 +103,12 @@ main(int argc, char **argv)
   int rows, cols, blocksize, orig_size;
   int n, m, sz, *factors, tmp, factor;
   char *stem, *filename; 
-  char **buffer, *buf_file, *block;
+  char **buffer;
+  struct header *headers;
   struct stat buf;
+  FILE **outfiles;
   FILE *f;
   SHA_CTX ctx;
-  struct header file_header;
 
   if (argc != 5) {
     fprintf(stderr, "usage: rs_encode_file filename n m stem\n");
@@ -90,20 +135,27 @@ main(int argc, char **argv)
   }
   blocksize = sz/n;
 
-  file_header.version = 1;
   if ((sz - orig_size) < 0 || (sz - orig_size) > 255 || n > 255 || m > 255) {
       fprintf(stderr, "Huh\n");
       abort();
   }
-  file_header.under_size = sz - orig_size;
 
-  buffer = (char **) malloc(sizeof(char *)*n);
-  for (i = 0; i < n; i++) {
-    buffer[i] = (char *) malloc(blocksize);
-    if (buffer[i] == NULL) {
-      perror("Allocating buffer to store the whole file");
-      exit(1);
-    }
+  buffer = (char **) malloc(sizeof(char *)*rows);
+  if (buffer == NULL) abort();
+  headers = (struct header *)malloc(sizeof(struct header)*rows);
+
+  for(i = 0; i < rows; ++i) {
+      headers[i].version = 1;
+      headers[i].under_size = sz - orig_size;
+      setnmchunknum(headers+i, n, m, i);
+  }
+      
+  for (i = 0; i < n+1; i++) { // one extra buffer for all ecc calculations
+      buffer[i] = (char *) malloc(blocksize);
+      if (buffer[i] == NULL) {
+	  perror("Allocating buffer to store the whole file");
+	  exit(1);
+      }
   }
 
   f = fopen(filename, "r");
@@ -124,30 +176,16 @@ main(int argc, char **argv)
       cache_size -= blocksize;
   }
   fclose(f);
-  SHA1_Final(file_header.sha1_file_hash, &ctx);
-  
-  buf_file = (char *) malloc(sizeof(char)*(strlen(stem)+30));
-  if (buf_file == NULL) { perror("malloc - buf_file"); exit(1); }
-  block = (char *) malloc(sizeof(char)*blocksize);
-  if (block == NULL) { perror("malloc - block"); exit(1); }
-  for (i = 0; i < n; i++) {
-      int ret;
-      sprintf(buf_file, "%s-%04d.rs", stem, i);
-      setnmchunknum(&file_header, n,m,i);
-      printf("Writing %s ...", buf_file); fflush(stdout);
-      f = fopen(buf_file, "w");
-      if (f == NULL) { perror(buf_file); exit(1); }
-      SHA1_Init(&ctx);
-      SHA1_Update(&ctx, &file_header, 4+20);
-      SHA1_Update(&ctx, buffer[i], blocksize);
-      SHA1_Final(file_header.sha1_chunk_hash, &ctx);
-      ret = fwrite(&file_header, 1, sizeof(file_header), f);
-      if (ret != sizeof(file_header)) { perror(buf_file); exit(1); }
-      ret = fwrite(buffer[i], 1, blocksize, f);
-      if (ret != blocksize) { perror(buf_file); exit(1); }
-      ret = fclose(f);
-      if (ret != 0) { perror(buf_file); exit(1); }
-      printf(" Done\n");
+  SHA1_Final(headers[0].sha1_file_hash, &ctx);
+  for(i = 1; i < rows; ++i) {
+      memcpy(headers[i].sha1_file_hash, headers[0].sha1_file_hash, 
+	     sizeof(headers[0].sha1_file_hash));
+  }
+
+  outfiles = malloc(sizeof(FILE *)*rows);
+  for(i=0; i < n; ++i) {
+      outfiles[i] = openFile(stem, i);
+      writeBuffer(outfiles[i], i, headers+i, buffer[i], blocksize);
   }
 
   factors = (int *) malloc(sizeof(int)*n);
@@ -158,38 +196,56 @@ main(int argc, char **argv)
   vdm = gf_make_dispersal_matrix(rows, cols);
 
   for (i = cols; i < rows; i++) {
-      int ret;
-      sprintf(buf_file, "%s-%04d.rs", stem, i);
-      printf("Calculating  %s ...", buf_file); fflush(stdout);
-      setnmchunknum(&file_header, n,m,i);
-      memset(block, 0, blocksize); 
+      printf("Calculating parity fragment %d ...", i); fflush(stdout);
+      memset(buffer[n], 0, blocksize); 
       for (j = 0; j < cols; j++) {
 	  tmp = vdm[i*cols+j]; 
 	  if (tmp != 0) {
 	      factor = gf_single_divide(tmp, factors[j]);
 	      factors[j] = tmp;
 	      gf_mult_region(buffer[j], blocksize, factor);
-	      gf_add_parity(buffer[j], block, blocksize);
+	      gf_add_parity(buffer[j], buffer[n], blocksize);
 	  }
       }
-      printf(" writing  ..."); fflush(stdout);
-      f = fopen(buf_file, "w");
-      if (f == NULL) { perror(buf_file); exit(1); }
+      printf("done.\n");
+      outfiles[i] = openFile(stem, i);
+      writeBuffer(outfiles[i], i, headers+i, buffer[n], blocksize);
+  }
+
+  printf("Calculating final hashes and updating files...\n");
+  // calculate cross-chunk hash...
+
+  SHA1_Init(&ctx);
+  for(i=0; i<rows; ++i) {
+      SHA1_Update(&ctx, &headers[i], offsetof(struct header, sha1_crosschunk_hash));
+      SHA1_Update(&ctx, headers[i].sha1_chunk_hash, 20);
+  }
+  SHA1_Final(headers[0].sha1_crosschunk_hash, &ctx);
+  for(i=1; i<rows; ++i) {
+      memcpy(headers[i].sha1_crosschunk_hash, headers[0].sha1_crosschunk_hash, 20);
+  }
+
+  // calculate chunk hash, update header, close...
+  for(i=0; i<rows; ++i) {
+      int ret;
+
       SHA1_Init(&ctx);
-      if (sizeof(struct header) != 4+20+20) {
-	  fprintf(stderr, "Header size mismatch\n");
-	  abort();
+      // SHA1(data) is in sha1_chunk_hash, so include it...
+      SHA1_Update(&ctx, &headers[i], sizeof(struct header));
+      SHA1_Final(headers[i].sha1_chunk_hash, &ctx);
+      
+      ret = fseek(outfiles[i], 0, SEEK_SET);
+      if (ret != 0) {
+	  perror("seek failed"); 
+	  exit(1); 
+      }	  
+      ret = fwrite(&headers[i], 1, sizeof(struct header), outfiles[i]);
+      if (ret != sizeof(struct header)) { 
+	  perror("header write failed"); 
+	  exit(1); 
       }
-      SHA1_Update(&ctx, &file_header, 4+20);
-      SHA1_Update(&ctx, block, blocksize);
-      SHA1_Final(file_header.sha1_chunk_hash, &ctx);
-      ret = fwrite(&file_header, 1, sizeof(file_header), f);
-      if (ret != sizeof(file_header)) { perror(buf_file); exit(1); }
-      ret = fwrite(block, 1, blocksize, f);
-      if (ret != blocksize) { perror(buf_file); exit(1); }
-      printf(" Done\n");
-      ret = fclose(f);
-      if (ret != 0) { perror(buf_file); exit(1); }
+      ret = fclose(outfiles[i]);
+      if (ret != 0) { perror("error closing file??"); exit(1); }
   }
 
   exit(0);
