@@ -6,6 +6,7 @@ use Digest::SHA1;
 use MIME::Base64;
 use FileHandle;
 use File::Copy;
+use File::Compare;
 
 $|=1;
 my $debug = 1;
@@ -15,16 +16,38 @@ my $debug = 1;
 # only has to specify the fixup rule once.
 
 usage("missing arguments.")
-    unless @ARGV >= 3;
+    unless @ARGV == 1 && -d $ARGV[0];
 
-my($importdir,@eccdirs) = @ARGV;
+my $eccfsdir = $ARGV[0];
+
+my($importdir,@eccdirs);
+{
+    open(MAGIC,"$eccfsdir/.magic-info")
+	or die "Unable to open $eccfsdir/.magic-info for read: $!";
+    my $tmp = '';
+    my $amt = read(MAGIC,$tmp,16384);
+
+    chomp $tmp;
+    my @lines = split("\n",$tmp);
+    die "Invalid version info in $eccfsdir/.magic-info"
+	unless $lines[0] eq 'V1';
+    shift @lines;
+    die "Invalid line 2 in $eccfsdir/.magic-info"
+	unless $lines[0] =~ /^1 (\d+)$/o;
+    my $neccdirs = $1;
+    shift @lines;
+    die "??" . scalar (@lines) . " != 1+$neccdirs" unless @lines == 1+$neccdirs;
+    $importdir = shift @lines;
+    @eccdirs = @lines;
+    close(MAGIC);
+}
 
 usage("importdir not a dir") unless -d $importdir;
 map { usage("eccdir $_ not a dir") unless -d $_; } @eccdirs;
 
-my $rs_encode_file = "$ENV{HOME}/rs_encode_file";
+my $rs_encode_file = "$ENV{HOME}/projects/eccfs/gflib/rs_encode_file";
 die "$rs_encode_file not executable" unless -x $rs_encode_file;
-my $rs_decode_file = "$ENV{HOME}/rs_decode_file";
+my $rs_decode_file = "$ENV{HOME}/projects/eccfs/gflib/rs_decode_file";
 die "$rs_decode_file not executable" unless -x $rs_decode_file;
 
 my $workbase = "/tmp/workdir";
@@ -38,6 +61,45 @@ mkdir($decodedir, 0770) or die "Can't mkdir $decodedir: $!";
 find(\&wanted, $importdir);
 rmdir($encodedir) or die "Can't rmdir $encodedir: $!";
 rmdir($decodedir) or die "Can't rmdir $decodedir: $!";
+
+system("sync") == 0 
+    or die "sync failed: $!";
+
+foreach my $subname (sort keys %Global::reverify_directories) {
+    foreach my $eccdir (@eccdirs) {
+	die "??" unless -d "$eccdir/$subname";
+    }
+}
+
+foreach my $subname (sort keys %Global::reverify_files) {
+    my ($eccusedirs, $n, $m) = @{$Global::reverify_files{$subname}};
+    my %inuse;
+    my @eccfiles = map { $inuse{$_} = 1; "$_/$subname" } @$eccusedirs;
+    foreach my $eccdir (@eccdirs) {
+	next if $inuse{$eccdir};
+	die "Incorrectly still existing file $eccdir/$subname"
+	    if -f "$eccdir/$subname";
+    }
+    verifyEccSplitup("$importdir/$subname", \@eccfiles, $n, $m, 0);
+    die "Mismatch between $importdir/$subname and $eccfsdir/.force-ecc/$subname"
+	unless compare("$importdir/$subname","$eccfsdir/.force-ecc/$subname") == 0;
+    my $fh = new FileHandle "$importdir/$subname"
+	or die "bad";
+    my $sha1 = Digest::SHA1->new();
+    $sha1->addfile($fh);
+    my $digest = $sha1->hexdigest();
+    $fh->close();
+    
+    unlink("$importdir/$subname") or die "Can't remove $importdir/$subname: $!";
+    $fh = new FileHandle "$eccfsdir/$subname"
+	or die "bad";
+    $sha1 = new Digest::SHA1;
+    $sha1->addfile($fh);
+    my $eccdigest = $sha1->hexdigest();
+    $fh->close();
+    die "Mayday, checked ecc data but now it's changed $digest != $eccdigest for $subname"
+	unless $digest eq $eccdigest;
+}
 
 print "TODO: reverify files after copy to ecc dirs, verify proper decode through eccfs, and clear out import...\n";
 %Global::reverify_directories if 0;
@@ -101,7 +163,7 @@ sub handlefile {
     
     my $eccsize = 4+20+20 + POSIX::ceil($import_size / $n); # header + datasize
     my @eccfiles = map { sprintf("%s/ecc-%04d.rs", $encodedir, $_) } (0 .. $n+$m - 1);
-    verifyEccSplitup("$importdir/$subname", \@eccfiles, $n, $m);
+    verifyEccSplitup("$importdir/$subname", \@eccfiles, $n, $m, 1);
 
     # Don't have to worry about parent directories as they would already have been processed by
     # handledir when handling importing of the parent
@@ -131,10 +193,20 @@ sub handlefile {
 	copy($from, "$eccdir/$subname")
 	    or die "Unable to copy $from to $eccdir/$subname: $!";
 	++$i;
+	# this is just unlinking the temporary ecc working stuff ...
 	unlink($from) or die "Unable to unlink $from: $!";
     }
+    foreach my $eccdir (@eccdirs) {
+	my $tmp = new FileHandle("+<$eccdir/$subname")
+	    or die "bad $eccdir/$subname: $!";
+	my $tmp2 = new IO::Handle;
+	$tmp2->fdopen(fileno($tmp),"w");
+	$tmp2->sync() or die "bad: $!";
+	$tmp->close();
+    }
+
     die "internal $i != $n + $m" unless $i == $n + $m;
-    $Global::reverify_files{$subname} = \@eccusedirs;
+    $Global::reverify_files{$subname} = [\@eccusedirs, $n, $m];
 }
 
 sub getFixup {
@@ -189,7 +261,7 @@ sub existsAnyEcc {
 
 
 sub usage {
-    die "$_[0]\nUsage: $0 <importdir> <eccdirs...>"
+    die "$_[0]\nUsage: $0 <eccfs-mount-point>"
 }
 
 sub determineNM {
@@ -206,7 +278,7 @@ sub selectEccDirs {
 }
 
 sub verifyEccSplitup {
-    my($dataname, $files, $n, $m) = @_;
+    my($dataname, $files, $n, $m, $verify_level) = @_;
 
     print "verifyEccSplitup($dataname, [ " . join(", ", @$files) . "], $n, $m)\n"
 	if $debug;
@@ -234,10 +306,26 @@ sub verifyEccSplitup {
     my $under_size = $rounded_size - $size;
     die "??" unless $under_size >= 0 && $under_size < 256;
 
-    print "TODO: VERIFY that sha1 of chunks read together add up to sha1 of orig file\n";
+    my $sha1_crosschunk = new Digest::SHA1;
+    my $sha1_filehash = new Digest::SHA1;
+    my $crosschunk_hash;
     for(my $i=0; $i < @$files; ++$i) {
-	verifyFile($i, $under_size, $rounded_size / $n, $n, $m, $file_digest, $files->[$i]);
+	my $tmp = verifyFile($i, $under_size, $rounded_size / $n, $n, $m, 
+			     $file_digest, $files->[$i], $sha1_crosschunk, $sha1_filehash);
+	$crosschunk_hash = $tmp unless defined $crosschunk_hash;
+	die "Crosschunk hash mismatch" unless $crosschunk_hash eq $tmp;
     }
+
+    my $file_digest_over_chunks = $sha1_filehash->digest();
+    die "Mismatch between digest calculated over file ecc chunks and file digest: " .
+	unpack("H*",$file_digest_over_chunks) . " != " . unpack("H*",$file_digest)
+	unless $file_digest eq $file_digest_over_chunks;
+    my $crosschunk_digest_over_chunks = $sha1_crosschunk->digest();
+    die "Mismatch between crosschunk_digest calculated over chunks and stored digest: " .
+	unpack("H*",$crosschunk_digest_over_chunks) . " != " . unpack("H*",$crosschunk_hash)
+	unless $crosschunk_digest_over_chunks eq $crosschunk_hash;
+    
+    return if $verify_level == 0;
 
     for(my $remove_start = 0; $remove_start < $n; ++$remove_start) {
 	my @recover_from = @$files;
@@ -251,16 +339,17 @@ sub verifyEccSplitup {
 }
 
 sub verifyFile {
-    my($chunknum, $under_size, $chunk_size, $n, $m, $file_digest, $chunkname) = @_;
+    my($chunknum, $under_size, $chunk_size, $n, $m, $file_digest, $chunkname,
+       $sha1_crosschunk, $sha1_filehash) = @_;
 
     print "    verifyFile($chunknum, $chunkname)..." if $debug;
     my $fh = new FileHandle($chunkname) 
 	or die "Unable to open $chunkname for read: $!";
     
     my $header;
-    my $amt = sysread($fh, $header, 4+20+20);
+    my $amt = sysread($fh, $header, 4+3*20);
 
-    die "read bad" unless 4+20+20 == $amt;
+    die "read bad" unless 4+3*20 == $amt;
     my($version, $f_under_size, $f_infoa, $f_infob) = unpack("CCCC", $header);
     
     die "Bad version $version != 1" 
@@ -279,29 +368,48 @@ sub verifyFile {
     die "Bad file_chunknum $f_chunknum != $chunknum"
 	unless $f_chunknum == $chunknum;
 
-    my $f_file_digest = substr($header,4,20);
+    my $f_file_digest = substr($header, 4, 20);
     die "Bad file hash " . unpack("H*",$f_file_digest) . " != " . unpack("H*", $file_digest)
 	unless $f_file_digest eq $file_digest;
+    my $f_crosschunk_hash = substr($header, 4+20, 20);
+    my $f_chunk_digest = substr($header, 4+2*20, 20);
 
     my $sha1 = new Digest::SHA1;
 
-    $sha1->add(substr($header,0,4+20));
     my $bytes_read = 0;
+    my $filesize = $n * $chunk_size - $under_size;
+    my $filedata_remain = $filesize - $chunknum * $chunk_size;
     while (1) {
 	my $buffer;
 	$amt = sysread($fh, $buffer, 262144);
 	die "Read failed: $!" unless defined $amt && $amt >= 0;
 	last if $amt == 0;
 	$sha1->add($buffer);
+	if ($filedata_remain > length($buffer)) {
+	    $sha1_filehash->add($buffer);
+	} elsif ($filedata_remain > 0) {
+	    $sha1_filehash->add(substr($buffer, 0, $filedata_remain));
+	} else {
+	    # ignore, not part of file data...
+	}
 	$bytes_read += $amt;
+	$filedata_remain -= $amt;
     }
     die "Didn't get proper number of bytes from reading chunk; $bytes_read != $chunk_size"
 	unless $bytes_read == $chunk_size;
-    my $f_chunk_digest = substr($header, 4+20, 20);
+
+    my $filechunk_digest = $sha1->digest();
+    
+    $sha1->reset();
+    $sha1->add(substr($header, 0, 4+2*20), $filechunk_digest);
     my $chunk_digest = $sha1->digest();
     die "Bad chunk hash " . unpack("H*",$f_chunk_digest) . " != " . unpack("H*",$chunk_digest)
 	unless $f_chunk_digest eq $chunk_digest;
     print "ok\n" if $debug;
+
+    $sha1_crosschunk->add(substr($header, 0, 4+20), $filechunk_digest);
+
+    return $f_crosschunk_hash;
 }
 
 sub verifyRecover {
