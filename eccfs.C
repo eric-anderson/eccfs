@@ -27,8 +27,11 @@
 #include <LintelAssert.H>
 #include <StringUtil.H>
 #include <HashUnique.H>
+#include <HashMap.H>
 
 #include <openssl/sha.h>
+#include <boost/format.hpp>
+#include <boost/foreach.hpp>
 
 static const int reverify_interval_seconds = 3600*24;
 static const bool debug_read = true;
@@ -43,7 +46,9 @@ struct header {
     unsigned char under_size;
     unsigned char n_m_filenum_a; // 5 bits: n, 5 bits: m, 6 bits: filenum
     unsigned char n_m_filenum_b;
+    // see gflib/header.h for the details on how the next three hashes are calculated
     unsigned char sha1_file_hash[20];
+    unsigned char sha1_crosschunk_hash[20];
     unsigned char sha1_chunk_hash[20];
 
     inline unsigned getn() {
@@ -71,7 +76,16 @@ prefixequal(const string &str, const string &prefix)
 }
 
 static string force_ecc_directory("/.force-ecc");
-static string force_ecc_prefix("/.force-ecc/");
+static string force_ecc_prefix(force_ecc_directory + "/");
+
+static string magic_info_file("/.magic-info");
+static string just_imported_directory("/.just-imported");
+static string just_imported_prefix(just_imported_directory + "/");
+
+// TODO: put something in that clears the various caches if they
+// exceed some fixed size; otherwise the two HashMaps will grow
+// unbounded.
+
 class EccFS {
 public:
     void init(eccfs_args *args) {
@@ -87,75 +101,88 @@ public:
 	    string &tmp = eccdirs[i];
 	    AssertAlways(tmp[tmp.size()-1] != '/',("bad"));
 	}
+	magic_info_data = (boost::format("V1\n1 %d\n") % eccdirs.size()).str();
+	magic_info_data.append(importdir);
+	magic_info_data.append("\n");
+	BOOST_FOREACH(string &tmp, eccdirs) {
+	    magic_info_data.append(tmp);
+	    magic_info_data.append("\n");
+	}
+
     }
 
     int getattr_ecc(const string &path, struct stat *stbuf) {
 	string tmp;
 
-
 	for(unsigned i = 0; i < eccdirs.size(); ++i) {
 	    tmp = eccdirs[i] + path;
 	    cout << "lstat-try(" << tmp << ")\n";
-	    int ret = lstat(tmp.c_str(), stbuf);
-	    if (ret == 0) {
-		int fd = open(tmp.c_str(), O_RDONLY | O_LARGEFILE);
-		if (fd == -1) {
-		    errno = EINVAL;
-		    goto bad;
-		}
+	    int lstat_ret = lstat(tmp.c_str(), stbuf);
+	    if (lstat_ret == -1 && errno == ENOENT) {
+		continue;
+	    }
+	    if (lstat_ret != 0) {
+		int save_errno = errno;
+		cout << boost::format("error on lstat(%s): %s") % tmp % strerror(save_errno) << endl;
+		return -save_errno;
+	    }
 
-		struct header tmp;
-		ssize_t ret = read(fd, &tmp, sizeof(struct header));
-		if (ret != sizeof(struct header)) {
-		    goto close_bad;
-		}
+	    if (S_ISDIR(stbuf->st_mode)) {
+		return 0;
+	    }
+	    int fd = open(tmp.c_str(), O_RDONLY | O_LARGEFILE);
+	    if (fd == -1) {
+		cout << boost::format("unable to open %s: %s") % tmp % strerror(errno) << endl;
+		return -EINVAL;
+	    }
 
-		if (tmp.version != 1) {
-		    goto close_bad;
-		}
-
-		{
-		    unsigned n = tmp.getn();
-		    unsigned long long orig_size = 
-			(unsigned long long)(stbuf->st_size-sizeof(struct header)) * n - tmp.under_size;
-		    unsigned long long sz = orig_size;
-		    if (sz % (n*sizeof(unsigned char)) != 0) {
-			sz += (n*sizeof(unsigned char) - (sz % (n*sizeof(unsigned char))));
-		    }
-		    unsigned long long blocksize = sz/n;
-		    if (blocksize != (unsigned long long)(stbuf->st_size - sizeof(struct header))) {
-			fprintf(stderr, "huh confused blocksize on %s?\n", path.c_str());
-			goto close_bad;
-		    }
-		    
-		    stbuf->st_size = orig_size;
-		    ret = close(fd);
-		    if (ret != 0) {
-			fprintf(stderr, "Warning, error on close: %s\n", strerror(errno));
-		    }
+	    struct header hdr;
+	    ssize_t ret = read(fd, &hdr, sizeof(struct header));
+	    if (ret != sizeof(struct header)) {
+		cout << boost::format("unable to read header from %s, only got %d bytes") % tmp % ret << endl;
+		goto close_bad;
+	    }
 	    
-		    goto ok;
+	    if (hdr.version != 1) {
+		goto close_bad;
+	    }
+	    
+	    {
+		unsigned n = hdr.getn();
+		unsigned long long orig_size = 
+		    (unsigned long long)(stbuf->st_size-sizeof(struct header)) * n - hdr.under_size;
+		unsigned long long sz = orig_size;
+		if (sz % (n*sizeof(unsigned char)) != 0) {
+		    sz += (n*sizeof(unsigned char) - (sz % (n*sizeof(unsigned char))));
 		}
-
-	    close_bad:
+		unsigned long long blocksize = sz/n;
+		if (blocksize != (unsigned long long)(stbuf->st_size - sizeof(struct header))) {
+		    fprintf(stderr, "huh confused blocksize on %s?\n", path.c_str());
+		    goto close_bad;
+		}
+		    
+		stbuf->st_size = orig_size;
 		ret = close(fd);
 		if (ret != 0) {
 		    fprintf(stderr, "Warning, error on close: %s\n", strerror(errno));
 		}
-		errno = EINVAL;
-		goto bad;
+		
+		goto ok;
 	    }
-	    if (ret != -1 || errno != ENOENT) {
-		goto bad;
+	    
+	close_bad:
+	    ret = close(fd);
+	    if (ret != 0) {
+		fprintf(stderr, "Warning, error on close: %s\n", strerror(errno));
 	    }
+	    errno = EINVAL;
+	    goto bad;
 	}
 
 	cout << "getattr(" << path << ") ERROR: not found anywhere\n";
 	return -ENOENT;
 	
     bad:
-	cout << "weird error getattr(" << path << ") ERROR " << errno << ";" << strerror(errno) << "\n";
-	
 	return -errno;
     ok:
 	stbuf->st_dev = 0;
@@ -165,13 +192,36 @@ public:
     }
 
     int fuse_getattr(const string &path, struct stat *stbuf) {
-	if (path == force_ecc_directory) {
+	if (path == force_ecc_directory || path == just_imported_directory) {
 	    return fuse_getattr("/", stbuf); // works as well as anything else...
+	}
+	if (path == magic_info_file) {
+	    int ret = fuse_getattr("/", stbuf);
+	    if (ret == 0) {
+		stbuf->st_mode = 0100664;
+		stbuf->st_nlink = 1;
+		stbuf->st_size = magic_info_data.size();
+		stbuf->st_blocks = 8;
+	    }
+	    return ret;
 	}
 	if (prefixequal(path, force_ecc_prefix)) {
 	    string subpath(path, force_ecc_prefix.size() - 1);
 	    fprintf(stderr, "force ecc prefix %s -> %s\n", path.c_str(), subpath.c_str());
 	    return getattr_ecc(subpath, stbuf);
+	}
+	if (prefixequal(path, just_imported_prefix)) {
+	    string subpath(path, just_imported_prefix.size() - 1);
+	    fprintf(stderr, "clearing crosschunk cache for %s\n", subpath.c_str());
+	    crosschunk_hash_cache.remove(subpath, false);
+	    string tmp;
+	    for(unsigned i=0; i < eccdirs.size(); ++i) {
+		tmp = eccdirs[i] + subpath;
+		fprintf(stderr, "clearing verify cache for %s\n", tmp.c_str());
+		last_chunk_checksum_verify.remove(tmp, false);
+	    }
+	    // return a strange error as positive acknowledgment
+	    return -ERANGE; // ought not ever get an error about math result not reproducable from a FS
 	}
 	// cout << "getattr(" << path << ");\n";
 	// TODO: get stats from multiple places and cross verify
@@ -285,6 +335,9 @@ public:
 	    fprintf(stderr, "force ecc prefix %s -> %s\n", path.c_str(), subpath.c_str());
 	    return open_ecc(subpath, fi);
 	}
+	if (path == magic_info_file) {
+	    return 0;
+	}
 	string tmp = importdir + path;
 	int fd = open(tmp.c_str(), fi->flags);
 	if (fd == -1) {
@@ -314,6 +367,13 @@ public:
 					struct header &header,
 					unsigned long long blocksize) {
 	time_t now = time(NULL);
+
+	// TODO: store the header sha1 checksum as well as the
+	// timestamp and only consider a validation ok if the header
+	// hasn't changed checksums in practice if it has the
+	// crosschunk hash should fail to validate, but this is yet
+	// another good paranoia check.
+
 	if (last_chunk_checksum_verify[path] > now - reverify_interval_seconds) {
 	    return true; // verified recently, assume still ok.
 	}
@@ -321,11 +381,10 @@ public:
 
 	SHA1_Init(&ctx);
 
-	if (sizeof(header) != 4+20+20) {
+	if (sizeof(header) != 4+3*20) {
 	    fprintf(stderr, "Header size mismatch\n");
 	    abort();
 	}
-	SHA1_Update(&ctx, &header, 4+20);
 	
 	const unsigned bufsize = 1024*1024;
 	char buf[bufsize];
@@ -344,19 +403,28 @@ public:
 	}
 	int amt = read(fd, buf, 1);
 	if (amt != 0) {
-	    fprintf(stderr, "Failed to get EOF from %s after reading %d + %d bytes\n", 
-		    path.c_str(), sizeof(struct header), blocksize);
+	    fprintf(stderr, "Failed to get EOF from %s after reading %d + %lld bytes\n", 
+		    path.c_str(), (int)sizeof(struct header), blocksize);
 	    return false;
 	}
 
+	unsigned char tmpdigest[20];
+	SHA1_Final(tmpdigest, &ctx);
+
+	SHA1_Init(&ctx);
+	SHA1_Update(&ctx, &header, 4+2*20);
+	SHA1_Update(&ctx, tmpdigest, 20);
+
 	unsigned char digest[20];
 	SHA1_Final(digest, &ctx);
+
 	if (memcmp(digest, header.sha1_chunk_hash, 20) != 0) {
 	    fprintf(stderr, "Digest mismatch while reading %s\n",
 		    path.c_str());
 	    return false;
 	}
 	
+	last_chunk_checksum_verify[path] = now;
 	return true;
     }
 
@@ -364,7 +432,8 @@ public:
     ssize_t 
     read_ecc_if_correct_chunk(int fd, string &path, 
 			      char *buf, off_t offset, 
-			      size_t size, unsigned long long &orig_size) {
+			      size_t size, unsigned long long &orig_size,
+			      const string &eccfs_path) {
 	struct header tmp;
 	ssize_t ret = read(fd, &tmp, sizeof(struct header));
 	if (ret != sizeof(struct header)) {
@@ -384,6 +453,20 @@ public:
 	    return -1;
 	}
 	
+	if (!crosschunk_hash_cache.exists(eccfs_path)) {
+	    crosschunk_hash_cache[eccfs_path] = string((char *)tmp.sha1_crosschunk_hash,20);
+	}
+
+	const string &crosschunk_hash = crosschunk_hash_cache[eccfs_path];
+	if (crosschunk_hash.size() != 20) {
+	    fprintf(stderr, "internal error, cache bad");
+	    return -1;
+	}
+
+	if (memcmp(crosschunk_hash.data(), tmp.sha1_crosschunk_hash, 20) != 0) {
+	    fprintf(stderr, "crosschunk hash differs\n");
+	    return -1;
+	}
 	unsigned n = tmp.getn();
 	orig_size = 
 	    (unsigned long long)(stat_buf.st_size-sizeof(struct header)) * n - tmp.under_size;
@@ -462,7 +545,8 @@ public:
 		}
 		unsigned long long orig_size;
 		ssize_t amt_read = read_ecc_if_correct_chunk(fd, tmp, buf, offset, 
-							     remain_size, orig_size);
+							     remain_size, orig_size,
+							     path);
 		if (amt_read >= 0) {
 		    offset += amt_read;
 		    remain_size -= amt_read;
@@ -475,6 +559,11 @@ public:
 			// Asked to read more than is present in the file...
 			size -= remain_size;
 			remain_size = 0;
+		    }
+		    int ret = close(fd);
+		    if (ret != 0) {
+			fprintf(stderr, "Error on close");
+			return -EINVAL;
 		    }
 		    break;
 		}
@@ -494,6 +583,16 @@ public:
 	return -EINVAL;
     }
 
+    int read_magic_info(char *buf, size_t size, off_t offset) {
+	if (offset != 0) 
+	    return -EINVAL;
+	if (size < magic_info_data.size()) {
+	    return -EINVAL;
+	}
+	memcpy(buf,magic_info_data.data(),magic_info_data.size());
+	return magic_info_data.size();
+    }
+
     int fuse_read(const string &path, char *buf, size_t size, 
 	     off_t offset) {
 	if (debug_read) {
@@ -503,6 +602,9 @@ public:
 	    string subpath(path, force_ecc_prefix.size() - 1);
 	    fprintf(stderr, "force ecc prefix %s -> %s\n", path.c_str(), subpath.c_str());
 	    return read_ecc(subpath, buf, size, offset);
+	}
+	if (path == magic_info_file) {
+	    return read_magic_info(buf, size, offset);
 	}
 	string tmp = importdir + path;
 	int fd = open(tmp.c_str(), O_RDONLY);
@@ -523,6 +625,8 @@ private:
     vector<string> eccdirs;
     string importdir;
     HashMap<string, time_t> last_chunk_checksum_verify;
+    HashMap<string, string> crosschunk_hash_cache;
+    string magic_info_data;
 };
 
 eccfs_args eccfs_args;

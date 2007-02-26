@@ -1,8 +1,9 @@
-CFLAGS := -D_FILE_OFFSET_BITS=64 -D_REENTRANT -DFUSE_USE_VERSION=25 -Wall -g -I/opt/fuse/include  -I/root/build/include/Lintel
+LINTEL_DIR := /home/anderse/build/optimize
+CFLAGS := -D_FILE_OFFSET_BITS=64 -D_REENTRANT -DFUSE_USE_VERSION=25 -Wall -g -I/opt/fuse/include  -I$(LINTEL_DIR)/include/Lintel -I/home/anderse/projects/ticoli/simulator/boost_foreach
 CXXFLAGS := $(CFLAGS)
 
 eccfs: eccfs.o struct_def.o
-	g++ -o eccfs -L/opt/fuse/lib -L/root/build/lib eccfs.o struct_def.o -lfuse -lLintel -lcrypto -Wl,--rpath -Wl,/root/build/lib -Wl,--rpath -Wl,/opt/fuse/lib
+	g++ -o eccfs -L/opt/fuse/lib -L$(LINTEL_DIR)/lib eccfs.o struct_def.o -lfuse -lLintel -lcrypto -Wl,--rpath -Wl,$(LINTEL_DIR)/lib -Wl,--rpath -Wl,/opt/fuse/lib
 
 run: eccfs
 	[ -d /tmp/import ] || mkdir /tmp/import

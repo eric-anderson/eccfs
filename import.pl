@@ -81,6 +81,12 @@ foreach my $subname (sort keys %Global::reverify_files) {
 	    if -f "$eccdir/$subname";
     }
     verifyEccSplitup("$importdir/$subname", \@eccfiles, $n, $m, 0);
+
+    # Tell eccfs that we have just imported $subname
+    my @ret = stat("$eccfsdir/.just-imported/$subname");
+    die "just-imported stat failed: $!" 
+	unless @ret == 0 && $! eq 'Numerical result out of range';
+
     die "Mismatch between $importdir/$subname and $eccfsdir/.force-ecc/$subname"
 	unless compare("$importdir/$subname","$eccfsdir/.force-ecc/$subname") == 0;
     my $fh = new FileHandle "$importdir/$subname"
@@ -101,9 +107,6 @@ foreach my $subname (sort keys %Global::reverify_files) {
 	unless $digest eq $eccdigest;
 }
 
-print "TODO: reverify files after copy to ecc dirs, verify proper decode through eccfs, and clear out import...\n";
-%Global::reverify_directories if 0;
-%Global::reverify_files if 0;
 exit(0);
 
 sub wanted {
