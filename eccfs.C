@@ -24,10 +24,10 @@
 #include <stdlib.h>
 #include <string.h>
 
-#include <LintelAssert.H>
-#include <StringUtil.H>
-#include <HashUnique.H>
-#include <HashMap.H>
+#include <Lintel/LintelAssert.H>
+#include <Lintel/StringUtil.H>
+#include <Lintel/HashUnique.H>
+#include <Lintel/HashMap.H>
 
 #include <openssl/sha.h>
 #include <boost/format.hpp>

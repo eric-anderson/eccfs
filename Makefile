@@ -1,5 +1,5 @@
 LINTEL_DIR := /home/anderse/build/optimize
-CFLAGS := -D_FILE_OFFSET_BITS=64 -D_REENTRANT -DFUSE_USE_VERSION=25 -Wall -g -I/opt/fuse/include  -I$(LINTEL_DIR)/include/Lintel -I/home/anderse/projects/ticoli/simulator/boost_foreach
+CFLAGS := -D_FILE_OFFSET_BITS=64 -D_REENTRANT -DFUSE_USE_VERSION=25 -Wall -g -I/opt/fuse/include  -I$(LINTEL_DIR)/include -I/home/anderse/projects/ticoli/simulator/boost_foreach
 CXXFLAGS := $(CFLAGS)
 
 eccfs: eccfs.o struct_def.o
