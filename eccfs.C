@@ -6,6 +6,9 @@
     See the file COPYING.
 */
 
+// TODO: figure out why eccfs is currently getting the sizes wrong with
+// du, even though the cmp works properly.
+
 // #include <config.h>
 
 #ifdef linux

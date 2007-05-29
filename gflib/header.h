@@ -38,13 +38,14 @@ inline unsigned getchunknum(struct header *h) {
 inline void setnmchunknum(struct header *h, unsigned n, 
 			 unsigned m, unsigned chunknum) {
     if (n > 31 || m > 31 || chunknum > n + m) {
-	fprintf(stderr,"internal\n");
+	fprintf(stderr,"internal %d %d %d\n", n,m,chunknum);
 	abort();
     }
-    h->n_m_chunknum_a = (n << 3) | (((m >> 2) & 0x07) << 5);
+    h->n_m_chunknum_a = (n << 3) | ((m >> 2) & 0x07);
     h->n_m_chunknum_b = ((m & 0x3) << 6) | chunknum;
     if (getn(h) != n || getm(h) != m || getchunknum(h) != chunknum) {
-	fprintf(stderr,"internal\n");
+	fprintf(stderr,"internal %d,%d %d,%d %d,%d\n",
+		getn(h), n, getm(h),m, getchunknum(h), chunknum);
 	abort();
     }
 }

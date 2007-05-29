@@ -38,7 +38,7 @@
 CC_GCC = gcc 
 CFLAGS_GCC = -O3 -g -march=pentium-m
 CC_ICC = /opt/intel/cc/9.0/bin/icc
-CFLAGS_ICC = -static -O3 -Qoption,c,-ip_ninl_max_stats=2000 -xB -ipo -fomit-frame-pointer 
+CFLAGS_ICC = -static -O3 -Qoption,c,-ip_ninl_max_stats=2000 -xW -ipo -fomit-frame-pointer 
 CC = huh-this-did-not-happen
 # CFLAGS = -g
 
@@ -56,17 +56,74 @@ CC = huh-this-did-not-happen
 ALL =	gf_mult gf_div parity_test \
         xor rs_encode_file rs_decode_file
 
+help:
+	@echo "use one of the following targets: w8-gcc, w8-icc-prof_gen w8-icc-prof_use eric-time-rs_xcode"
+
 w8-gcc:
 	make "CFLAGS=$(CFLAGS_GCC) -DW_8 -DTABLE" "CC=$(CC_GCC)" $(ALL)
 
 w8-icc-prof_gen: 
+	-rm *.o
 	make "CFLAGS=$(CFLAGS_ICC) -prof_gen -DW_8 -DTABLE" "CC=$(CC_ICC)" $(ALL)
 
 w8-icc-prof_use: 
+	-rm *.o
 	make "CFLAGS=$(CFLAGS_ICC) -prof_use -DW_8 -DTABLE" "CC=$(CC_ICC)" $(ALL)
 
-help:
-	@ echo "use one of the following targets: w8-gcc, w8-icc-prof_gen w8-icc-prof_use"
+eric-time-rs_xcode:
+	[ ! -d tmp ] || rm -rf tmp
+	mkdir tmp
+	-rm *.dyn
+	./rs_encode_file ~/pictures/eric-good/large/sandcrab-1.jpg 1 5 tmp/a
+	rm tmp/a-000[0-4].rs
+	./rs_decode_file tmp/a >tmp/decode
+	cmp ~/pictures/eric-good/large/sandcrab-1.jpg tmp/decode
+
+	./rs_encode_file ~/pictures/eric-good/large/sandcrab-1.jpg 3 1 tmp/a
+	rm tmp/a-0002.rs
+	./rs_decode_file tmp/a >tmp/decode
+	cmp ~/pictures/eric-good/large/sandcrab-1.jpg tmp/decode
+
+	./rs_encode_file ~/pictures/eric-good/large/sandcrab-1.jpg 3 2 tmp/a
+	rm tmp/a-000[02].rs
+	./rs_decode_file tmp/a >tmp/decode
+	cmp ~/pictures/eric-good/large/sandcrab-1.jpg tmp/decode
+
+	./rs_encode_file ~/pictures/eric-good/large/sandcrab-1.jpg 4 2 tmp/a
+	rm tmp/a-000[13].rs
+	./rs_decode_file tmp/a >tmp/decode
+	cmp ~/pictures/eric-good/large/sandcrab-1.jpg tmp/decode
+
+	./rs_encode_file ~/pictures/eric-good/large/sandcrab-1.jpg 8 4 tmp/a
+	rm tmp/a-000[0356].rs
+	./rs_decode_file tmp/a >tmp/decode
+	cmp ~/pictures/eric-good/large/sandcrab-1.jpg tmp/decode
+
+	./rs_encode_file ~/pictures/eric-good/psd/hummingbird-5.psd.bz2 1 5 tmp/a
+	rm tmp/a-000[0-4].rs
+	./rs_decode_file tmp/a >tmp/decode
+	cmp ~/pictures/eric-good/psd/hummingbird-5.psd.bz2 tmp/decode
+
+	./rs_encode_file ~/pictures/eric-good/psd/hummingbird-5.psd.bz2 3 1 tmp/a
+	rm tmp/a-0002.rs
+	./rs_decode_file tmp/a >tmp/decode
+	cmp ~/pictures/eric-good/psd/hummingbird-5.psd.bz2 tmp/decode
+
+	./rs_encode_file ~/pictures/eric-good/psd/hummingbird-5.psd.bz2 3 2 tmp/a
+	rm tmp/a-000[02].rs
+	./rs_decode_file tmp/a >tmp/decode
+	cmp ~/pictures/eric-good/psd/hummingbird-5.psd.bz2 tmp/decode
+
+	./rs_encode_file ~/pictures/eric-good/psd/hummingbird-5.psd.bz2 4 2 tmp/a
+	rm tmp/a-000[13].rs
+	./rs_decode_file tmp/a >tmp/decode
+	cmp ~/pictures/eric-good/psd/hummingbird-5.psd.bz2 tmp/decode
+
+	./rs_encode_file ~/pictures/eric-good/psd/hummingbird-5.psd.bz2 8 4 tmp/a
+	rm tmp/a-000[0356].rs
+	./rs_decode_file tmp/a >tmp/decode
+	cmp ~/pictures/eric-good/psd/hummingbird-5.psd.bz2 tmp/decode
+	rm -rf tmp
 
 #w16:
 #	make "CFLAGS=$(CFLAGS) -DW_16 -DTABLE" $(ALL)

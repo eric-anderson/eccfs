@@ -7,6 +7,7 @@ use MIME::Base64;
 use FileHandle;
 use File::Copy;
 use File::Compare;
+use Filesys::Statvfs;
 
 $|=1;
 $GLOBAL::debug = 1;
@@ -153,12 +154,13 @@ sub handlefile {
     print "  handleFile($subname)\n" if $GLOBAL::debug;
 
     my ($n,$m) = determineNM($subname);
+    print "import $subname as ($n,$m)\n";
     my $max = @eccdirs;
     die "Unable to import $subname, should be broken into $n data and $m parity pieces, but only $max places available"
 	unless $n + $m <= $max;
 
     my $import_size = -s "$importdir/$subname";
-    my @eccusedirs = selectEccDirs($n + $m);
+    my @eccusedirs = selectEccDirs($n, $m);
     die "huh" . scalar @eccusedirs unless @eccusedirs == $n + $m;
     my $q_subname = quotemeta($subname);
     my $ret = system("$rs_encode_file $importdir/$q_subname $n $m $encodedir/ecc");
@@ -174,6 +176,7 @@ sub handlefile {
 
     foreach my $eccdir (@eccdirs) {
 	if (-f "$eccdir/$subname") {
+	    die "temporarily disabled overwrite until we fix it so that files will be saved until the new ones appear";
 	    unlink("$eccdir/$subname");
 	} elsif (-d "$eccdir/$subname") {
 	    my $t = getFixup($subname, "$eccdir/$subname is a directory, but $importdir/$subname is a file.");
@@ -200,7 +203,7 @@ sub handlefile {
 	# this is just unlinking the temporary ecc working stuff ...
 	unlink($from) or die "Unable to unlink $from: $!";
     }
-    foreach my $eccdir (@eccdirs) {
+    foreach my $eccdir (@eccusedirs) {
 	my $tmp = new FileHandle("+<$eccdir/$subname")
 	    or die "bad $eccdir/$subname: $!";
 	my $tmp2 = new IO::Handle;
@@ -266,19 +269,6 @@ sub existsAnyEcc {
 
 sub usage {
     die "$_[0]\nUsage: $0 <eccfs-mount-point>"
-}
-
-sub determineNM {
-    my ($filename) = @_;
-
-    return (2,2);
-}
-
-sub selectEccDirs {
-    my ($ndirs) = @_;
-
-    die "??" unless $ndirs <= @eccdirs;
-    return @eccdirs[0 .. $ndirs-1];
 }
 
 sub verifyEccSplitup {
@@ -457,5 +447,47 @@ sub verifyRecover {
 	unlink($target)
 	    or die "Unable to unlink $target: $!";
     }
+}
+
+sub pickMostFree {
+    my ($from_dirs, $count) = @_;
+
+    return () if $count == 0;
+    my %freespace;
+    map { 
+	my ($bsize, $frsize, $blocks, $bfree, $bavail,
+	    $files, $ffree, $favail, $flag, $namemax) = statvfs($_);
+	$freespace{$_} = $bavail * $bsize;
+    } @$from_dirs;
+    my @sorted = sort { $freespace{$b} <=> $freespace{$a} } @$from_dirs;
+    return @sorted[0 .. $count - 1];
+}
+
+sub selectEccDirs {
+    my ($n, $m) = @_;
+
+    die "??" unless $n + $m <= @eccdirs;
+
+    my @parity_only = grep(/parity-only/o, @eccdirs);
+    my @anydata = grep(!/parity-only/o, @eccdirs);
+
+    die "need more data dirs, too many parity-only for ($n,$m)" 
+	unless $n <= @eccdirs - @parity_only;
+
+    my $parity_only = $m > @parity_only ? @parity_only : $m;
+
+    my @parity_dirs = pickMostFree(\@parity_only, $parity_only);
+
+    my @remain_dirs = pickMostFree(\@anydata, $n + $m - $parity_only);
+
+    return (@remain_dirs, @parity_dirs);
+}
+
+sub determineNM {
+    my ($filename) = @_;
+
+    return (3,2) if $filename =~ m!/1ds2-dcim/!o;
+    return (1,4) if $filename =~ m!/eric-good/psd/!o;
+    return (3,1);
 }
 
