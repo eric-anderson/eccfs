@@ -61,7 +61,11 @@ def doscan(curpos, eccdirs, skiptos, scancount):
         skipto = skiptos.pop(0)
         while len(filelist) > 0 and filelist[0] < skipto:
             filelist.pop(0)
-        
+	if filelist[0] != skipto:
+	    # not an exact match, prune skiptos so we don't incorrectly prune
+	    # on sub-directories
+	    skiptos = []        
+
     print curbase, " --> ", filelist
     if curbase != "/":
         curbase += "/"
@@ -132,6 +136,7 @@ def unionreaddir(eccdirs, basedir):
             found[file] = 1
     ret = found.keys()
     ret.sort()
+    print "unionreaddr(" + basedir + "): " + str(ret)
     return ret
 
 class ECCFile:
