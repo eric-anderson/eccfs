@@ -1,5 +1,5 @@
 #!/usr/bin/python
-import sys,os,re,string,sha
+import sys,os,re,string,sha,stat
 
 # call to main() is at the bottom of the script
 
@@ -108,14 +108,22 @@ def check_file(eccdirs, path):
     files.sort(lambda x,y: cmp(x.chunknum, y.chunknum))
 
     sha1 = sha.new()
+    sha1_filehash = sha.new()
     for i in range(len(files)):
         f = files[i]
         if f.chunknum != i:
             error("missing chunk")
         sha1.update(f.header + f.sha1_file_hash + f.sha1_data_digest)
+        if i < n:
+            bytes = f.chunk_size
+            if i == n-1:
+                bytes = f.chunk_size - f.under_size
+            f.sha_filedata(sha1_filehash, bytes)
 
     if sha1.digest() != sha1_crosschunk_hash:
         error("bad crosschunk hash")
+    if sha1_filehash.digest() != sha1_file_hash:
+        error("bad file hash")
         
 def unionreaddir(eccdirs, basedir):
     found = {}
@@ -147,12 +155,15 @@ class ECCFile:
         self.sha1_crosschunk_hash = self.xread(20)
         self.sha1_chunk_hash = self.xread(20)
 
+        statbits = os.fstat(self.file.fileno())
+        self.chunk_size = statbits[stat.ST_SIZE] - (4+3*20)
+        self.file_size = self.chunk_size * self.n - self.under_size
+
         sha1 = sha.new()
-        while 1:
-            data = self.file.read(65536)
-            if len(data) == 0:
-                break
-            sha1.update(data)
+        self.sha_remaining(sha1, self.chunk_size)
+        tmp = self.file.read(1)
+        if len(tmp) != 0:
+            error("Found extra data at end of file")
         self.sha1_data_digest = sha1.digest()
 
         sha1 = sha.new()
@@ -164,9 +175,22 @@ class ECCFile:
         if check_chunk_hash != self.sha1_chunk_hash:
             error("Mismatch on chunk hash")
 
-        self.file.close()
         # print filename + ": n=" + str(self.n) + ", m=" + str(self.m) + ", chunknum=" + str(self.chunknum)
 
+    def sha_filedata(self, sha1, bytes):
+        self.file.seek(4+3*20)
+        self.sha_remaining(sha1, bytes)
+
+    def sha_remaining(self, sha1, bytes):
+        while bytes > 0:
+            amt = bytes
+            if amt > 256*1024:
+                amt = 256*1024
+            data = self.file.read(amt)
+            if len(data) != amt:
+                error("did not read expected amount")
+            sha1.update(data)
+            bytes -= amt
 
     def xread(self,n):
         ret = self.file.read(n)
