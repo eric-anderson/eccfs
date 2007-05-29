@@ -44,24 +44,25 @@ struct eccfs_args {
 struct header {
     unsigned char version;
     unsigned char under_size;
-    unsigned char n_m_filenum_a; // 5 bits: n, 5 bits: m, 6 bits: filenum
-    unsigned char n_m_filenum_b;
+    // 5 bits: n, 5 bits: m, 6 bits: chunknum details in gflib/header.h
+    unsigned char n_m_chunknum_a; 
+    unsigned char n_m_chunknum_b;
     // see gflib/header.h for the details on how the next three hashes are calculated
     unsigned char sha1_file_hash[20];
     unsigned char sha1_crosschunk_hash[20];
     unsigned char sha1_chunk_hash[20];
 
     inline unsigned getn() {
-	return n_m_filenum_a & 0x1F;
+	return (n_m_chunknum_a >> 3) & 0x1F;
     }
 
     inline unsigned getm() {
-	return (n_m_filenum_a >> 5) & 0x07 + 
-	    ((n_m_filenum_b & 0x03) << 3);
+	return ((n_m_chunknum_a & 0x07) << 2) |
+	    (n_m_chunknum_b >> 6);
     }
 
-    inline unsigned getfilenum() {
-	return (n_m_filenum_b >> 2) & 0x3F;
+    inline unsigned getchunknum() {
+	return n_m_chunknum_b & 0x3F;
     }
 };
 
@@ -480,7 +481,7 @@ public:
 	    return -1;
 	}
 	
-	unsigned filenum = tmp.getfilenum();
+	unsigned filenum = tmp.getchunknum();
 	
 	if (filenum >= n) {
 	    if (debug_read) fprintf(stderr, "SKIP - ecc-chunk\n");

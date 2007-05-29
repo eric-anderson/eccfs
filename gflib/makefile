@@ -113,11 +113,11 @@ gf_mult: gf_mult.o gflib.o
 	$(CC) $(CFLAGS) -o gf_mult gf_mult.o gflib.o
 
 
-rs_encode_file.o: gflib.h gflib.o
+rs_encode_file.o: gflib.h gflib.o header.h
 rs_encode_file: rs_encode_file.o gflib.o
 	$(CC) $(CFLAGS) -o rs_encode_file rs_encode_file.o gflib.o -lcrypto
 
-rs_decode_file.o: gflib.h gflib.o
+rs_decode_file.o: gflib.h gflib.o header.h
 rs_decode_file: rs_decode_file.o gflib.o
 	$(CC) $(CFLAGS) -o rs_decode_file rs_decode_file.o gflib.o -lcrypto
 
