@@ -292,7 +292,7 @@ public:
 	
 	HashUnique<string> unique;
 	int ret = readdir_partial(importdir + path, buf, filler, unique);
-	if (ret != 0) {
+	if (ret != 0 && ret != -ENOENT) { // ok to not have directory in import dir.
 	    return ret;
 	}
 	for(unsigned i = 0; i < eccdirs.size(); ++i) {

@@ -1,5 +1,7 @@
 #!/usr/bin/perl -w
 use strict;
+use threads;
+use threads::shared;
 use File::Find;
 use POSIX;
 use Digest::SHA1;
@@ -8,81 +10,80 @@ use FileHandle;
 use File::Copy;
 use File::Compare;
 use Filesys::Statvfs;
+use Fcntl ':flock';
+use Carp;
+use Getopt::Long;
+use File::Path;
 
 $|=1;
-$GLOBAL::debug = 1;
+$GLOBAL::debug = 0;
 
-# Notes: $Global::fixup{subname} defines the rules for fixing up
-# conflicts between files and directories.  This is so that the user
-# only has to specify the fixup rule once.
+my $files_under;
+my $base_dir;
+my $nthreads = 3;
 
+my $ret = GetOptions("path=s" => \$files_under,
+		     "base=s" => \$base_dir,
+		     "threads=i" => \$nthreads);
 usage("missing arguments.")
-    unless @ARGV == 1 && -d $ARGV[0];
+    unless $ret && @ARGV == 1 && -d $ARGV[0];
 
 my $eccfsdir = $ARGV[0];
 
-my($importdir,@eccdirs);
-{
-    open(MAGIC,"$eccfsdir/.magic-info")
-	or die "Unable to open $eccfsdir/.magic-info for read: $!";
-    my $tmp = '';
-    my $amt = read(MAGIC,$tmp,16384);
+my($lock, $rs_encode_file, $rs_decode_file, $workbase, $encodedir,
+   $decodedir, $importdir, @eccdirs) = setup();
 
-    chomp $tmp;
-    my @lines = split("\n",$tmp);
-    die "Invalid version info in $eccfsdir/.magic-info"
-	unless $lines[0] eq 'V1';
-    shift @lines;
-    die "Invalid line 2 in $eccfsdir/.magic-info"
-	unless $lines[0] =~ /^1 (\d+)$/o;
-    my $neccdirs = $1;
-    shift @lines;
-    die "??" . scalar (@lines) . " != 1+$neccdirs" unless @lines == 1+$neccdirs;
-    $importdir = shift @lines;
-    @eccdirs = @lines;
-    close(MAGIC);
+if (defined $files_under) {
+    $base_dir ||= "";
+    setupFilesUnder($files_under,$base_dir,$importdir);
 }
 
-usage("importdir not a dir") unless -d $importdir;
-map { usage("eccdir $_ not a dir") unless -d $_; } @eccdirs;
+# Notes: $fixup_decisions{subname} defines the rules for fixing up
+# conflicts between files and directories.  This is so that the user
+# only has to specify the fixup rule once.
 
-my $rs_encode_file = "$ENV{HOME}/projects/eccfs/gflib/rs_encode_file";
-die "$rs_encode_file not executable" unless -x $rs_encode_file;
+my %reverify_directories;
+my %reverify_files : shared;
+my %fixup_decisions : shared; # this may not need to be shared
 
-my $rs_decode_file = "$ENV{HOME}/projects/eccfs/gflib/rs_decode_file";
-die "$rs_decode_file not executable" unless -x $rs_decode_file;
-
-my $workbase = "/tmp/workdir";
-unless (-d $workbase) {
-    mkdir($workbase, 0770) or die "Can't mkdir $workbase: $!";
+my @pending_imports : shared;
+my $done : shared;
+$done = 0;
+my @threads;
+for(my $i=0; $i < $nthreads; ++$i) {
+    push(@threads, threads->create(sub { importerThread($i) }));
 }
-my $encodedir = "$workbase/encode";
-mkdir($encodedir, 0770) or die "Can't mkdir $encodedir: $!";
-my $decodedir = "$workbase/decode";
-mkdir($decodedir, 0770) or die "Can't mkdir $decodedir: $!";
 find(\&wanted, $importdir);
+{
+    lock(@pending_imports);
+    $done = 1;
+    cond_broadcast(@pending_imports);
+}
+print "Waiting for importers to finish...\n";
+foreach my $thread (@threads) {
+    my $ret = $thread->join();
+    die "import thread failed??" unless $ret;
+}
+die "??" unless @pending_imports == 0;
 rmdir($encodedir) or die "Can't rmdir $encodedir: $!";
 rmdir($decodedir) or die "Can't rmdir $decodedir: $!";
 
+print "Syncing filesystem...\n";
 system("sync") == 0 
     or die "sync failed: $!";
 
-foreach my $subname (sort keys %Global::reverify_directories) {
-    foreach my $eccdir (@eccdirs) {
-	die "??" unless -d "$eccdir/$subname";
-    }
-}
-
-foreach my $subname (sort keys %Global::reverify_files) {
-    my ($eccusedirs, $n, $m) = @{$Global::reverify_files{$subname}};
+print "Reverifying files...\n";
+foreach my $subname (sort keys %reverify_files) {
+    print "   verify $subname\n";
+    my ($n, $m, @eccusedirs) = @{$reverify_files{$subname}};
     my %inuse;
-    my @eccfiles = map { $inuse{$_} = 1; "$_/$subname" } @$eccusedirs;
+    my @eccfiles = map { $inuse{$_} = 1; "$_/$subname" } @eccusedirs;
     foreach my $eccdir (@eccdirs) {
 	next if $inuse{$eccdir};
 	die "Incorrectly still existing file $eccdir/$subname"
 	    if -f "$eccdir/$subname";
     }
-    verifyEccSplitup($decodedir, "$importdir/$subname", \@eccfiles, $n, $m, 0);
+    verifyEccSplitup('xx', $decodedir, "$importdir/$subname", \@eccfiles, $n, $m, 0);
 
     # Tell eccfs that we have just imported $subname
     my @ret = stat("$eccfsdir/.just-imported/$subname");
@@ -109,14 +110,95 @@ foreach my $subname (sort keys %Global::reverify_files) {
 	unless $digest eq $eccdigest;
 }
 
+print "Reverifying directories...\n";
+foreach my $subname (reverse sort keys %reverify_directories) {
+    foreach my $eccdir (@eccdirs) {
+	die "??" unless -d "$eccdir/$subname";
+    }
+    next if $subname eq '';
+
+    rmdir("$importdir/$subname")
+	or die "Can't rmdir $importdir/$subname: $!";
+}
+
 exit(0);
+
+sub setup {
+    {
+	open(MAGIC,"$eccfsdir/.magic-info")
+	    or die "Unable to open $eccfsdir/.magic-info for read: $!";
+	my $tmp = '';
+	my $amt = read(MAGIC,$tmp,16384);
+	
+	chomp $tmp;
+	my @lines = split("\n",$tmp);
+	die "Invalid version info in $eccfsdir/.magic-info"
+	    unless $lines[0] eq 'V1';
+	shift @lines;
+	die "Invalid line 2 in $eccfsdir/.magic-info"
+	    unless $lines[0] =~ /^1 (\d+)$/o;
+	my $neccdirs = $1;
+	shift @lines;
+	die "??" . scalar (@lines) . " != 1+$neccdirs" unless @lines == 1+$neccdirs;
+	$importdir = shift @lines;
+	@eccdirs = @lines;
+	close(MAGIC);
+    }
+    
+    usage("importdir '$importdir' not a dir") unless -d $importdir;
+    map { usage("eccdir $_ not a dir") unless -d $_; } @eccdirs;
+    
+    my $rs_encode_file = "$ENV{HOME}/projects/eccfs/gflib/rs_encode_file";
+    die "$rs_encode_file not executable" unless -x $rs_encode_file;
+    
+    my $rs_decode_file = "$ENV{HOME}/projects/eccfs/gflib/rs_decode_file";
+    die "$rs_decode_file not executable" unless -x $rs_decode_file;
+    
+    my $workbase = "/tmp/workdir";
+    unless (-d $workbase) {
+	mkdir($workbase, 0770) or die "Can't mkdir $workbase: $!";
+    }
+    my $lock = getlock("$workbase/lock",60);
+    die "Could not get lock file; another import is running??"
+	unless defined $lock;
+    my $encodedir = "$workbase/encode";
+    if (-d $encodedir) {
+	opendir(DIR, $encodedir) or die "noopendir $encodedir: $!";
+	while(my $file = readdir(DIR)) {
+	    next unless $file =~ /^ecc/o;
+	    unlink("$encodedir/$file")
+		or die "can't remove $encodedir/$file: $!";
+	}
+	closedir(DIR);
+    } else {
+	mkdir($encodedir, 0770) or die "Can't mkdir $encodedir: $!";
+    }
+    my $decodedir = "$workbase/decode";
+    if (-d $decodedir) {
+	opendir(DIR, $decodedir) or die "noopendir $decodedir: $!";
+	while(my $file = readdir(DIR)) {
+	    next unless $file =~ /^decode/o;
+	unlink("$decodedir/$file")
+	    or die "can't remove $decodedir/$file: $!";
+	}
+	closedir(DIR);
+    } else {
+	mkdir($decodedir, 0770) or die "Can't mkdir $decodedir: $!";
+    }
+    return ($lock, $rs_encode_file, $rs_decode_file, $workbase,
+	    $encodedir, $decodedir, $importdir, @eccdirs);
+}
 
 sub wanted {
     my $subname = $File::Find::name;
     $subname =~ s!^$importdir!!o or die "?? $File::Find::name";
     $subname =~ s!^/+!!o;
     print "Wanted ($File::Find::name) -> $subname\n" if $GLOBAL::debug;
-    if (-d $File::Find::name) {
+    if (-l $File::Find::name) {
+	warn "importing symlink $File::Find::name as a file"
+	    unless defined $files_under;
+	handlefile($subname);
+    } elsif (-d $File::Find::name) {
 	handledir($subname);
     } elsif (-f $File::Find::name) {
 	handlefile($subname);
@@ -145,11 +227,45 @@ sub handledir {
 	}
 	mkdir("$eccdir/$subname",0777) or die "Can't mkdir $eccdir/$subname: $!";
     }
-    $Global::reverify_directories{$subname} = 1;
+    $reverify_directories{$subname} = 1;
 }
 
 sub handlefile {
     my($subname) = @_;
+
+    # TODO: consider doing a bit of waiting if @pending_imports is really long
+    lock(@pending_imports);
+    push(@pending_imports, $subname);
+    cond_signal(@pending_imports);
+}
+
+sub getPending {
+    lock(@pending_imports);
+    while(1) {
+	return shift @pending_imports
+	    if @pending_imports > 0;
+	return undef if $done;
+	cond_wait(@pending_imports);
+    }
+}
+
+sub importerThread {
+    my ($threadid) = @_;
+
+    print "Start importer thread #$threadid...\n";
+    while(1) {
+	my $file = getPending();
+	last unless defined $file;
+	importfile($file, $threadid);
+    }
+    lock(@pending_imports);
+    die "??" unless $done;
+    print "Finish importer thread #$threadid...\n";
+    return 1;
+}
+
+sub importfile {
+    my($subname, $threadid) = @_;
 
     print "  handleFile($subname)\n" if $GLOBAL::debug;
 
@@ -163,20 +279,23 @@ sub handlefile {
     my @eccusedirs = selectEccDirs($n, $m);
     die "huh" . scalar @eccusedirs unless @eccusedirs == $n + $m;
     my $q_subname = quotemeta($subname);
-    my $ret = system("$rs_encode_file $importdir/$q_subname $n $m $encodedir/ecc");
+    my $ret = system("$rs_encode_file $importdir/$q_subname $n $m $encodedir/ecc-t$threadid >/dev/null 2>&1");
     die "Encoding of $subname failed?"
 	unless $ret == 0;
     
     my $eccsize = 4+20+20 + POSIX::ceil($import_size / $n); # header + datasize
-    my @eccfiles = map { sprintf("%s/ecc-%04d.rs", $encodedir, $_) } (0 .. $n+$m - 1);
-    verifyEccSplitup($decodedir, "$importdir/$subname", \@eccfiles, $n, $m, 1);
+    my @eccfiles = map { sprintf("%s/ecc-t$threadid-%04d.rs", $encodedir, $_) } (0 .. $n+$m - 1);
+    verifyEccSplitup($threadid, $decodedir, "$importdir/$subname", \@eccfiles, $n, $m, 1);
 
     # Don't have to worry about parent directories as they would already have been processed by
     # handledir when handling importing of the parent
 
+    my $warned = 0;
     foreach my $eccdir (@eccdirs) {
 	if (-f "$eccdir/$subname") {
-	    die "temporarily disabled overwrite until we fix it so that files will be saved until the new ones appear";
+	    warn "WARNING: overwriting $subname, might not successfully create new version"
+		unless $warned;
+	    $warned = 1;
 	    unlink("$eccdir/$subname");
 	} elsif (-d "$eccdir/$subname") {
 	    my $t = getFixup($subname, "$eccdir/$subname is a directory, but $importdir/$subname is a file.");
@@ -191,35 +310,43 @@ sub handlefile {
 	}
     }
 
-    my %selected;
-    map { $selected{$_} = 1 } @eccusedirs;
+    die "??" unless @eccusedirs == $n + $m;
     my $i = 0;
-    foreach my $eccdir (@eccdirs) {
-	next unless $selected{$eccdir};
-	my $from = sprintf("%s/ecc-%04d.rs", $encodedir, $i);
+    foreach my $eccdir (@eccusedirs) {
+	my $from = sprintf("%s/ecc-t$threadid-%04d.rs", $encodedir, $i);
 	copy($from, "$eccdir/$subname")
 	    or die "Unable to copy $from to $eccdir/$subname: $!";
 	++$i;
 	# this is just unlinking the temporary ecc working stuff ...
 	unlink($from) or die "Unable to unlink $from: $!";
     }
+    
+    # Interestingly, the evidence is that this makes the import run
+    # faster; presumably it's managing to overlap more of the I/Os.
+
     foreach my $eccdir (@eccusedirs) {
-	my $tmp = new FileHandle("+<$eccdir/$subname")
-	    or die "bad $eccdir/$subname: $!";
-	my $tmp2 = new IO::Handle;
-	$tmp2->fdopen(fileno($tmp),"w");
+  	my $tmp = new FileHandle("+<$eccdir/$subname")
+  	    or die "bad $eccdir/$subname: $!";
+  	my $tmp2 = new IO::Handle;
+  	$tmp2->fdopen(fileno($tmp),"w");
 	$tmp2->sync() or die "bad: $!";
-	$tmp->close();
+  	$tmp->close();
     }
 
     die "internal $i != $n + $m" unless $i == $n + $m;
-    $Global::reverify_files{$subname} = [\@eccusedirs, $n, $m];
+    lock(%reverify_files);
+    # This works, oddly you can't &share(['f','g','h'])
+    my $tmp = &share([]);
+    @$tmp = ($n, $m, @eccusedirs);
+    $reverify_files{$subname} = $tmp;
 }
 
 sub getFixup {
     my($subname, $msg) = @_;
 
-    while (! defined $Global::fixup{$subname}) {
+    lock(%fixup_decisions);
+    lock(@pending_imports); # lock this to make other threads not print stuff out
+    while (! defined $fixup_decisions{$subname}) {
 	print "$msg\n";
 	print "what do you want to do with existing $subname: abort, delete, or rename [abort]?";
 	my $choice = <STDIN>;
@@ -228,7 +355,7 @@ sub getFixup {
 	if ($choice =~ /^a(bort)?$/io) {
 	    exit(1);
 	} elsif ($choice =~ /^d(elete)?$/io) {
-	    $Global::fixup{$subname} = ['delete'];
+	    $fixup_decisions{$subname} = ['delete'];
 	} elsif ($choice =~ /^r(ename)?$/io) {
 	    my $n = 0;
 	    my $default = "$subname.$n";
@@ -245,16 +372,16 @@ sub getFixup {
 	    } elsif (existsAnyEcc($rename_to)) {
 		warn "$rename_to already exists in some ecc dir";
 	    } else {
-		$Global::fixup{$subname} = ['rename',$rename_to];
+		$fixup_decisions{$subname} = ['rename',$rename_to];
 	    }
 	} else {
 	    die "Unrecognized choice '$choice'";
 	}
     } 
 
-    print "Chose to $Global::fixup{$subname}->[0] $subname\n";
+    print "Chose to $fixup_decisions{$subname}->[0] $subname\n";
 
-    return $Global::fixup{$subname};
+    return $fixup_decisions{$subname};
 }
 
 sub existsAnyEcc {
@@ -272,7 +399,7 @@ sub usage {
 }
 
 sub verifyEccSplitup {
-    my($decodedir, $dataname, $files, $n, $m, $verify_level) = @_;
+    my($threadid, $decodedir, $dataname, $files, $n, $m, $verify_level) = @_;
 
     print "verifyEccSplitup($dataname, [ " . join(", ", @$files) . "], $n, $m)\n"
 	if $GLOBAL::debug;
@@ -328,7 +455,7 @@ sub verifyEccSplitup {
 	}
 	print "verifyRecover(skip $remove_start for $m)\n"
 	    if $GLOBAL::debug;
-	verifyRecover($decodedir, \@recover_from, $size, $file_digest);
+	verifyRecover($threadid, $decodedir, \@recover_from, $size, $file_digest);
     }
 }
 
@@ -359,7 +486,7 @@ sub verifyFile {
 	unless $f_n == $n;
     die "Bad file_m $f_m != $m"
 	unless $f_m == $m;
-    die "Bad file_chunknum $f_chunknum != $chunknum"
+    confess "Bad file_chunknum $f_chunknum != $chunknum from $chunkname"
 	unless $f_chunknum == $chunknum;
 
     my $f_file_digest = substr($header, 4, 20);
@@ -407,18 +534,18 @@ sub verifyFile {
 }
 
 sub verifyRecover {
-    my($decodedir, $recover_from, $expected_size, $file_digest) = @_;
+    my($threadid, $decodedir, $recover_from, $expected_size, $file_digest) = @_;
 
     for(my $i=0;$i<@$recover_from; ++$i) {
 	my $file = $recover_from->[$i];
 	next unless defined $file;
 	die "$file doesn't exist??" unless -f $file;
-	my $target = sprintf("%s/decode-%04d.rs",$decodedir, $i);
+	my $target = sprintf("%s/decode-t$threadid-%04d.rs",$decodedir, $i);
 	die "$target already exists" if -e $target || -l $target;
 	symlink($file, $target) 
 	    || die "Unable to symlink $file to $target";
     }
-    my $fh = new FileHandle "$rs_decode_file $decodedir/decode 2>/dev/null |"
+    my $fh = new FileHandle "$rs_decode_file $decodedir/decode-t$threadid 2>/dev/null |"
 	or die "Can't run $rs_decode_file $decodedir/decode: $!";
     my $sha1 = Digest::SHA1->new;
     my $bytes_read = 0;
@@ -443,7 +570,7 @@ sub verifyRecover {
     for(my $i=0;$i<@$recover_from; ++$i) {
 	my $file = $recover_from->[$i];
 	next unless defined $file;
-	my $target = sprintf("%s/decode-%04d.rs",$decodedir, $i);
+	my $target = sprintf("%s/decode-t$threadid-%04d.rs",$decodedir, $i);
 	unlink($target)
 	    or die "Unable to unlink $target: $!";
     }
@@ -490,4 +617,74 @@ sub determineNM {
     return (1,4) if $filename =~ m!/eric-good/psd/!o;
     return (3,1);
 }
+
+# undef on failure, lock fh on success
+sub getlock {
+    my($filename, $waittime) = @_;
+
+    my $fh = new FileHandle "+>>$filename"
+	or die "Unable to open $filename for append: $!";
+    
+    if (defined $waittime) {
+	my $start = time;
+	while(1) {
+	    my $ret = flock($fh,LOCK_EX|LOCK_NB);
+	    unless(defined $ret) {
+		die "flock failed: $!";
+	    }
+	    last if $ret;
+
+	    my $remain = $waittime - (time - $start);
+	    print STDERR "delayed waiting for lock, $remain seconds remain...\n";
+	    return undef
+		if (time - $start) >= $waittime;
+	    sleep(1);
+	}
+    } else {
+	unless(flock($fh,LOCK_EX)) {
+	    die "flock failed: $!";
+	}
+    }
+    my $now = localtime(time);
+    print $fh "Locked by $$ at $now\n";
+    $fh->flush();
+    return $fh;
+}
+
+sub setupFilesUnder {
+    my($files_under, $base_dir, $importdir) = @_;
+
+    $base_dir = "/$base_dir" unless $base_dir =~ m!^/!o;
+    die "--path argument needs to be absolute"
+	unless $files_under =~ m!^/!o;
+    opendir(DIR,"$importdir") or die "bad";
+    while(my $file = readdir(DIR)) {
+	next if $file eq '.' || $file eq '..';
+	die "--path is not allowed if there are already files in $importdir";
+    }
+    closedir(DIR);
+    
+    mkpath("$importdir/$base_dir")
+	or die "Can't mkdirpath $importdir/$base_dir";
+    
+    find(sub {
+	die "no symlinks $File::Find::name" 
+	    if -l $_;
+	die "?? $File::Find::name $files_under"
+	    unless substr($File::Find::name, 0, length $files_under) eq $files_under;
+	my $relpath = substr($File::Find::name, length $files_under);
+	return if $relpath eq '';
+	my $dest = "$importdir$base_dir$relpath";
+	if (-d $_) {
+	    mkdir($dest, 0777) 
+		or die "Unable to mkdir $dest: $!";
+	} elsif (-f $_) {
+	    symlink($File::Find::name, $dest)
+		or die "Can't symlink $File::Find::name to $dest: $!";
+	} else {
+	    die "?? $File::Find::name";
+	}
+    }, $files_under);
+}
+
 
