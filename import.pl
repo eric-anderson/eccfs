@@ -395,7 +395,7 @@ sub existsAnyEcc {
 
 
 sub usage {
-    die "$_[0]\nUsage: $0 <eccfs-mount-point>"
+    die "$_[0]\nUsage: $0 [--threads=#] <eccfs-mount-point>"
 }
 
 sub verifyEccSplitup {
@@ -615,6 +615,7 @@ sub determineNM {
 
     return (3,2) if $filename =~ m!/1ds2-dcim/!o;
     return (1,4) if $filename =~ m!/eric-good/psd/!o;
+    return (2,3) if $filename =~ /\.psd$/o;
     return (3,1);
 }
 

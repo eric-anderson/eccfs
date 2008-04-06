@@ -297,7 +297,7 @@ public:
 	}
 	for(unsigned i = 0; i < eccdirs.size(); ++i) {
 	    ret = readdir_partial(eccdirs[i] + path, buf, filler, unique);
-	    if (ret != 0) {
+	    if (ret != 0 && ret != -ENOENT) { // allow missing directories
 		return ret;
 	    }
 	}
